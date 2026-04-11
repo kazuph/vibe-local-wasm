@@ -283,82 +283,37 @@ async function getActor() {
   return client.vibeLocal.getOrCreate(["browser-core"]);
 }
 
-async function probeUrl(url: string, timeoutMs = 3000): Promise<boolean> {
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    const response = await fetch(`${url.replace(/\/$/, "")}/models`, {
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-    return response.ok;
-  } catch {
-    return false;
+function loadBackendSettings(): BackendSettings {
+  const configPath = path.join(homedir(), ".config", "opencode", "config.json");
+  if (!existsSync(configPath)) {
+    throw new Error(`OpenCode config not found at ${configPath}`);
   }
-}
 
-async function loadBackendSettings(): Promise<BackendSettings> {
-  // Default: local Ollama (matches vibe-local's default behavior)
-  const ollamaHost = process.env.OLLAMA_HOST ?? "http://localhost:11434";
-  const ollamaBaseUrl = `${ollamaHost}/v1`;
-  const defaults: BackendSettings = {
-    apiKey: "",
-    baseUrl: ollamaBaseUrl,
-    model: "",
+  const payload = JSON.parse(readFileSync(configPath, "utf8")) as OpenCodeConfig;
+  const providerEntries = Object.entries(payload.provider ?? {});
+  const preferred =
+    providerEntries.find(([key]) => key === "qwen-local") ??
+    providerEntries.find(([, value]) => Object.keys(value.models ?? {}).length > 0) ??
+    null;
+
+  if (!preferred) {
+    throw new Error("No OpenCode provider with models found.");
+  }
+
+  const [, providerConfig] = preferred;
+  const firstModelEntry = Object.entries(providerConfig.models ?? {})[0];
+  if (!firstModelEntry) {
+    throw new Error("Selected OpenCode provider has no models.");
+  }
+
+  return {
+    apiKey: providerConfig.options?.apiKey ?? "",
+    baseUrl: providerConfig.options?.baseURL ?? "",
+    model: firstModelEntry[0],
     maxTokens: 4096,
     systemPrompt: "You are a helpful coding assistant. Be concise.",
     temperature: 0.2,
   };
-
-  // Try to read OpenCode config for provider/model overrides
-  const configPath = path.join(homedir(), ".config", "opencode", "config.json");
-  if (existsSync(configPath)) {
-    try {
-      const payload = JSON.parse(readFileSync(configPath, "utf8")) as OpenCodeConfig;
-      const providerEntries = Object.entries(payload.provider ?? {});
-      const preferred =
-        providerEntries.find(([key]) => key === "qwen-local") ??
-        providerEntries.find(([, value]) => Object.keys(value.models ?? {}).length > 0) ??
-        null;
-
-      if (preferred) {
-        const [, providerConfig] = preferred;
-        const firstModelEntry = Object.entries(providerConfig.models ?? {})[0];
-        if (firstModelEntry) {
-          const candidateUrl = providerConfig.options?.baseURL ?? "";
-          // Check if the configured backend is reachable
-          if (candidateUrl && await probeUrl(candidateUrl)) {
-            defaults.apiKey = providerConfig.options?.apiKey ?? "";
-            defaults.baseUrl = candidateUrl;
-            defaults.model = firstModelEntry[0];
-            return defaults;
-          }
-          // If configured provider is unreachable, fall through to local Ollama
-        }
-      }
-    } catch {
-      // Fall through to Ollama auto-detection
-    }
-  }
-
-  // Fall back to local Ollama — auto-detect first available model
-  if (await probeUrl(ollamaBaseUrl)) {
-    try {
-      const response = await fetch(`${ollamaBaseUrl}/models`);
-      const body = (await response.json()) as { data?: Array<{ id: string }> };
-      const firstModel = body.data?.[0]?.id;
-      if (firstModel) {
-        defaults.model = firstModel;
-        return defaults;
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  // Last resort: env var or hardcoded default
-  defaults.model = process.env.VIBE_CODER_MODEL ?? "qwen3:8b";
-  return defaults;
 }
 
 function printPendingApprovals(snapshot: SessionSnapshot | null) {
@@ -406,7 +361,7 @@ async function runInteractiveChat(
   project: string,
   initialMode: "act" | "plan" | "yolo",
 ) {
-  const settings = await loadBackendSettings();
+  const settings = loadBackendSettings();
   const session = await actor.createSession(`CLI chat ${project}`);
   let mode = initialMode;
   let currentProject = project;
@@ -829,7 +784,7 @@ async function main() {
       const project = args[0];
       const prompt = args.slice(1).join(" ").trim();
       if (!project || !prompt) throw new Error("Missing <project> or <prompt...>");
-      const settings = await loadBackendSettings();
+      const settings = loadBackendSettings();
       const session = await actor.createSession(`CLI ${project}`);
       await actor.setSessionConfig(session.session.id, settings.model, "act");
       const runPromise = actor.runAgentTurn(session.session.id, prompt, settings, project);
@@ -863,7 +818,7 @@ async function main() {
     case "continue-session": {
       const sessionId = args[0];
       if (!sessionId) throw new Error("Missing <sessionId>");
-      const settings = await loadBackendSettings();
+      const settings = loadBackendSettings();
       const runPromise = actor.continueAgentTask(sessionId, settings);
       await watchSessionProgress(actor, sessionId, runPromise);
       console.log(
@@ -879,7 +834,7 @@ async function main() {
       const sessionId = args[0];
       const subAgentId = args[1];
       if (!sessionId || !subAgentId) throw new Error("Missing <sessionId> or <subAgentId>");
-      const settings = await loadBackendSettings();
+      const settings = loadBackendSettings();
       console.log(
         JSON.stringify(
           await actor.continueSubAgentTask(sessionId, subAgentId, settings),
@@ -893,7 +848,7 @@ async function main() {
       const project = args[0];
       const prompt = args.slice(1).join(" ").trim();
       if (!project || !prompt) throw new Error("Missing <project> or <prompt...>");
-      const settings = await loadBackendSettings();
+      const settings = loadBackendSettings();
       const session = await actor.createSession(`CLI ${project}`);
       await actor.setSessionConfig(session.session.id, settings.model, "plan");
       const runPromise = actor.runAgentTurn(session.session.id, prompt, settings, project);
@@ -911,7 +866,7 @@ async function main() {
       const project = args[0];
       const prompt = args.slice(1).join(" ").trim();
       if (!project || !prompt) throw new Error("Missing <project> or <prompt...>");
-      const settings = await loadBackendSettings();
+      const settings = loadBackendSettings();
       const session = await actor.createSession(`CLI ${project}`);
       await actor.setSessionConfig(session.session.id, settings.model, "yolo");
       const runPromise = actor.runAgentTurn(session.session.id, prompt, settings, project);
@@ -960,7 +915,7 @@ async function main() {
       if (!project || prompts.length === 0) {
         throw new Error("Usage: parallel-run [--mode read-only|act|plan|yolo] <project> <prompt1> -- <prompt2> [-- <prompt3>...]");
       }
-      const settings = await loadBackendSettings();
+      const settings = loadBackendSettings();
       const session = await actor.createSession(`CLI parallel ${project}`);
       await actor.setSessionConfig(session.session.id, settings.model, "act");
       const actionPromise = actor.runParallelAgentTasks(
@@ -987,7 +942,7 @@ async function main() {
       if (!project || !filePath || !prompt) {
         throw new Error("Missing <project>, <path>, or <prompt...>");
       }
-      const settings = await loadBackendSettings();
+      const settings = loadBackendSettings();
       const session = await actor.createSession(`CLI ${project}`);
       await actor.setSessionConfig(session.session.id, settings.model, "act");
       console.log(
