@@ -1,0 +1,8 @@
+node_modules/
+.DS_Store
+.pnpm-store/
+dist/
+test-results/
+playwright-report/
+tools/agentos-dev/.agentos-dev/
+vibe-local-pyodide/dist/

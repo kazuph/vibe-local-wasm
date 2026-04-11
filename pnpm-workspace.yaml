@@ -1,0 +1,12 @@
+packages:
+  - "tools/agentos-dev"
+  - "vibe-local-pyodide"
+
+onlyBuiltDependencies:
+  - "@parcel/watcher"
+  - "@sandbox-agent/cli-darwin-arm64"
+  - "better-sqlite3"
+  - "cbor-extract"
+  - "esbuild"
+  - "koffi"
+  - "protobufjs"
