@@ -99,18 +99,27 @@ async function watchSessionProgress(
   footer?: FixedFooter,
 ) {
   let settled = false;
+  let workError: unknown = null;
   let lastAssistantText = "";
   const seenToolEvents = new Set<string>();
   const seenSubAgentStates = new Map<string, string>();
 
-  void work.finally(() => {
+  // Capture error to throw after polling ends, prevent unhandled rejection crash
+  work.catch((err) => { workError = err; }).finally(() => {
     settled = true;
   });
 
   footer?.update({ status: "generating…" });
 
   while (!settled) {
-    const snapshot = (await actor.exportSession(sessionId)) as SessionSnapshot | null;
+    let snapshot: SessionSnapshot | null = null;
+    try {
+      snapshot = (await actor.exportSession(sessionId)) as SessionSnapshot | null;
+    } catch {
+      // polling may fail transiently; keep trying until work settles
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      continue;
+    }
     if (snapshot) {
       const orderedArtifacts = [...snapshot.artifacts].sort(
         (left, right) =>
@@ -156,7 +165,12 @@ async function watchSessionProgress(
     await new Promise((resolve) => setTimeout(resolve, 350));
   }
 
-  const finalSnapshot = (await actor.exportSession(sessionId)) as SessionSnapshot | null;
+  let finalSnapshot: SessionSnapshot | null = null;
+  try {
+    finalSnapshot = (await actor.exportSession(sessionId)) as SessionSnapshot | null;
+  } catch {
+    // best-effort final read
+  }
   const finalText = finalSnapshot?.task?.lastResponse ?? "";
   if (finalText.startsWith(lastAssistantText) && finalText.length > lastAssistantText.length) {
     process.stdout.write(finalText.slice(lastAssistantText.length));
@@ -171,6 +185,11 @@ async function watchSessionProgress(
   }
 
   footer?.update({ status: "idle" });
+
+  // Re-throw captured error so caller's try-catch sees it
+  if (workError) {
+    throw workError;
+  }
 }
 
 async function watchExistingSession(
@@ -623,11 +642,22 @@ async function runInteractiveChat(
         continue;
       }
 
-      const runPromise = actor.runAgentTurn(session.session.id, line, settings, currentProject);
-      await watchSessionProgress(actor, session.session.id, runPromise, footer);
-      const result = await runPromise;
-      console.log(dim(`task: ${result.task.status}`));
-      printPendingApprovals((await actor.exportSession(session.session.id)) as SessionSnapshot | null);
+      try {
+        const runPromise = actor.runAgentTurn(session.session.id, line, settings, currentProject);
+        // Watch progress while agent runs; errors are caught below
+        await watchSessionProgress(actor, session.session.id, runPromise, footer);
+        // Retrieve final snapshot to show result (runPromise rejection already suppressed in watcher)
+        const finalSnapshot = (await actor.exportSession(session.session.id)) as SessionSnapshot | null;
+        console.log(dim(`task: ${finalSnapshot?.task?.status ?? "unknown"}`));
+        printPendingApprovals(finalSnapshot);
+      } catch (err) {
+        footer.update({ status: "error" });
+        const msg = err instanceof Error ? err.message : String(err);
+        console.log(errorColor(`agent error: ${msg}`));
+        if (msg.includes("Internal error") || msg.includes("internal_error")) {
+          console.log(yellow("hint: check backend settings with /status, or server logs with AGENTOS_DEBUG=1"));
+        }
+      }
     }
   } finally {
     footer.teardown();
