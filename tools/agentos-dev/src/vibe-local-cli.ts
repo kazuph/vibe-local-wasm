@@ -310,7 +310,7 @@ function loadBackendSettings(): BackendSettings {
     apiKey: providerConfig.options?.apiKey ?? "",
     baseUrl: providerConfig.options?.baseURL ?? "",
     model: firstModelEntry[0],
-    maxTokens: 4096,
+    maxTokens: 1024,
     systemPrompt: "You are a helpful coding assistant. Be concise.",
     temperature: 0.2,
   };
