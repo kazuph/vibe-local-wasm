@@ -19,6 +19,7 @@ import {
   resolveProject,
   runProjectScript,
 } from "./projects.js";
+import { runGit, searchCode } from "./shared/git-utils.js";
 
 type SessionMode = "plan" | "act" | "yolo";
 type ChatRole = "assistant" | "system" | "user";
@@ -218,50 +219,7 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-async function runGit(args: string[]) {
-  try {
-    const { stdout, stderr } = await execFileAsync("git", args, {
-      cwd: REPO_ROOT,
-      timeout: 20_000,
-      maxBuffer: 1024 * 1024 * 2,
-    });
-
-    return { ok: true, stdout, stderr };
-  } catch (error) {
-    const typed = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string };
-    return {
-      ok: false,
-      stdout: typed.stdout ?? "",
-      stderr: typed.stderr ?? typed.message,
-    };
-  }
-}
-
-async function searchCode(query: string, maxResults: number) {
-  const { stdout } = await execFileAsync(
-    "rg",
-    [
-      "-n",
-      "--hidden",
-      "--glob",
-      "!**/node_modules/**",
-      "--glob",
-      "!**/.git/**",
-      "--glob",
-      "!tools/agentos-dev/node_modules/**",
-      query,
-      REPO_ROOT,
-    ],
-    {
-      cwd: REPO_ROOT,
-      timeout: 20_000,
-      maxBuffer: 1024 * 1024 * 4,
-    },
-  );
-
-  const lines = stdout.trim().split("\n").filter(Boolean);
-  return lines.slice(0, maxResults);
-}
+// runGit() and searchCode() are imported from ./shared/git-utils.js
 
 const CODING_TOOL_SCHEMAS = [
   {

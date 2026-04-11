@@ -1,9 +1,11 @@
 # vibe-local-wasm
 
-`vibe-local-wasm` は、`vibe-local` 風の coding agent 体験を Web と CLI の両方で使えるようにした standalone repository です。
+[ochyai/vibe-local](https://github.com/ochyai/vibe-local)（落合陽一氏による Free AI Coding Agent）の WASM 版です。
 
-現状の実装は、薄い chat-first UI の下に `agentOS + SQLite + sandbox-agent + AgentFS` を置く構成です。  
-Web でも CLI でも同じ actor-backed session を共有します。
+本家 `vibe-local` は Python stdlib only の単一ファイル (`vibe-coder.py`) で Ollama と直接通信するコーディングエージェントです。  
+本リポジトリはそのコア機能を `agentOS + SQLite + sandbox-agent + AgentFS` の上に再実装し、バックエンドを WASM (Pyodide) 上でも動かせるようにすることを目指しています。
+
+CLI/TUI の体験は本家 vibe-local に準拠します。本家にないコマンドや API は原則として実装しません。
 
 ## 現在の実装状況
 
