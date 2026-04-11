@@ -283,37 +283,82 @@ async function getActor() {
   return client.vibeLocal.getOrCreate(["browser-core"]);
 }
 
-function loadBackendSettings(): BackendSettings {
-  const configPath = path.join(homedir(), ".config", "opencode", "config.json");
-  if (!existsSync(configPath)) {
-    throw new Error(`OpenCode config was not found at ${configPath}`);
+async function probeUrl(url: string, timeoutMs = 3000): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const response = await fetch(`${url.replace(/\/$/, "")}/models`, {
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    return response.ok;
+  } catch {
+    return false;
   }
+}
 
-  const payload = JSON.parse(readFileSync(configPath, "utf8")) as OpenCodeConfig;
-  const providerEntries = Object.entries(payload.provider ?? {});
-  const preferred =
-    providerEntries.find(([key]) => key === "qwen-local") ??
-    providerEntries.find(([, value]) => Object.keys(value.models ?? {}).length > 0) ??
-    null;
-
-  if (!preferred) {
-    throw new Error("No OpenCode provider with models was found.");
-  }
-
-  const [providerName, providerConfig] = preferred;
-  const firstModelEntry = Object.entries(providerConfig.models ?? {})[0];
-  if (!firstModelEntry) {
-    throw new Error(`The selected OpenCode provider ${providerName} has no models.`);
-  }
-
-  return {
-    apiKey: providerConfig.options?.apiKey ?? "",
-    baseUrl: providerConfig.options?.baseURL ?? "",
-    model: firstModelEntry[0],
+async function loadBackendSettings(): Promise<BackendSettings> {
+  // Default: local Ollama (matches vibe-local's default behavior)
+  const ollamaHost = process.env.OLLAMA_HOST ?? "http://localhost:11434";
+  const ollamaBaseUrl = `${ollamaHost}/v1`;
+  const defaults: BackendSettings = {
+    apiKey: "",
+    baseUrl: ollamaBaseUrl,
+    model: "",
     maxTokens: 4096,
-    systemPrompt: "You are the browser core of vibe-local. Be concise, careful, and helpful.",
+    systemPrompt: "You are a helpful coding assistant. Be concise.",
     temperature: 0.2,
   };
+
+  // Try to read OpenCode config for provider/model overrides
+  const configPath = path.join(homedir(), ".config", "opencode", "config.json");
+  if (existsSync(configPath)) {
+    try {
+      const payload = JSON.parse(readFileSync(configPath, "utf8")) as OpenCodeConfig;
+      const providerEntries = Object.entries(payload.provider ?? {});
+      const preferred =
+        providerEntries.find(([key]) => key === "qwen-local") ??
+        providerEntries.find(([, value]) => Object.keys(value.models ?? {}).length > 0) ??
+        null;
+
+      if (preferred) {
+        const [, providerConfig] = preferred;
+        const firstModelEntry = Object.entries(providerConfig.models ?? {})[0];
+        if (firstModelEntry) {
+          const candidateUrl = providerConfig.options?.baseURL ?? "";
+          // Check if the configured backend is reachable
+          if (candidateUrl && await probeUrl(candidateUrl)) {
+            defaults.apiKey = providerConfig.options?.apiKey ?? "";
+            defaults.baseUrl = candidateUrl;
+            defaults.model = firstModelEntry[0];
+            return defaults;
+          }
+          // If configured provider is unreachable, fall through to local Ollama
+        }
+      }
+    } catch {
+      // Fall through to Ollama auto-detection
+    }
+  }
+
+  // Fall back to local Ollama — auto-detect first available model
+  if (await probeUrl(ollamaBaseUrl)) {
+    try {
+      const response = await fetch(`${ollamaBaseUrl}/models`);
+      const body = (await response.json()) as { data?: Array<{ id: string }> };
+      const firstModel = body.data?.[0]?.id;
+      if (firstModel) {
+        defaults.model = firstModel;
+        return defaults;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  // Last resort: env var or hardcoded default
+  defaults.model = process.env.VIBE_CODER_MODEL ?? "qwen3:8b";
+  return defaults;
 }
 
 function printPendingApprovals(snapshot: SessionSnapshot | null) {
@@ -361,7 +406,7 @@ async function runInteractiveChat(
   project: string,
   initialMode: "act" | "plan" | "yolo",
 ) {
-  const settings = loadBackendSettings();
+  const settings = await loadBackendSettings();
   const session = await actor.createSession(`CLI chat ${project}`);
   let mode = initialMode;
   let currentProject = project;
@@ -644,12 +689,17 @@ async function runInteractiveChat(
 
       try {
         const runPromise = actor.runAgentTurn(session.session.id, line, settings, currentProject);
-        // Watch progress while agent runs; errors are caught below
         await watchSessionProgress(actor, session.session.id, runPromise, footer);
-        // Retrieve final snapshot to show result (runPromise rejection already suppressed in watcher)
-        const finalSnapshot = (await actor.exportSession(session.session.id)) as SessionSnapshot | null;
-        console.log(dim(`task: ${finalSnapshot?.task?.status ?? "unknown"}`));
-        printPendingApprovals(finalSnapshot);
+        const result = (await runPromise) as Record<string, unknown>;
+        // Check for structured error response (actor returns error instead of throwing)
+        if (result?.error && typeof result.error === "string") {
+          footer.update({ status: "error" });
+          console.log(errorColor(`agent error: ${result.error}`));
+        } else {
+          const taskStatus = (result?.task as Record<string, unknown>)?.status ?? "unknown";
+          console.log(dim(`task: ${taskStatus}`));
+        }
+        printPendingApprovals((await actor.exportSession(session.session.id)) as SessionSnapshot | null);
       } catch (err) {
         footer.update({ status: "error" });
         const msg = err instanceof Error ? err.message : String(err);
@@ -779,7 +829,7 @@ async function main() {
       const project = args[0];
       const prompt = args.slice(1).join(" ").trim();
       if (!project || !prompt) throw new Error("Missing <project> or <prompt...>");
-      const settings = loadBackendSettings();
+      const settings = await loadBackendSettings();
       const session = await actor.createSession(`CLI ${project}`);
       await actor.setSessionConfig(session.session.id, settings.model, "act");
       const runPromise = actor.runAgentTurn(session.session.id, prompt, settings, project);
@@ -813,7 +863,7 @@ async function main() {
     case "continue-session": {
       const sessionId = args[0];
       if (!sessionId) throw new Error("Missing <sessionId>");
-      const settings = loadBackendSettings();
+      const settings = await loadBackendSettings();
       const runPromise = actor.continueAgentTask(sessionId, settings);
       await watchSessionProgress(actor, sessionId, runPromise);
       console.log(
@@ -829,7 +879,7 @@ async function main() {
       const sessionId = args[0];
       const subAgentId = args[1];
       if (!sessionId || !subAgentId) throw new Error("Missing <sessionId> or <subAgentId>");
-      const settings = loadBackendSettings();
+      const settings = await loadBackendSettings();
       console.log(
         JSON.stringify(
           await actor.continueSubAgentTask(sessionId, subAgentId, settings),
@@ -843,7 +893,7 @@ async function main() {
       const project = args[0];
       const prompt = args.slice(1).join(" ").trim();
       if (!project || !prompt) throw new Error("Missing <project> or <prompt...>");
-      const settings = loadBackendSettings();
+      const settings = await loadBackendSettings();
       const session = await actor.createSession(`CLI ${project}`);
       await actor.setSessionConfig(session.session.id, settings.model, "plan");
       const runPromise = actor.runAgentTurn(session.session.id, prompt, settings, project);
@@ -861,7 +911,7 @@ async function main() {
       const project = args[0];
       const prompt = args.slice(1).join(" ").trim();
       if (!project || !prompt) throw new Error("Missing <project> or <prompt...>");
-      const settings = loadBackendSettings();
+      const settings = await loadBackendSettings();
       const session = await actor.createSession(`CLI ${project}`);
       await actor.setSessionConfig(session.session.id, settings.model, "yolo");
       const runPromise = actor.runAgentTurn(session.session.id, prompt, settings, project);
@@ -883,7 +933,7 @@ async function main() {
       if (!sessionId || !approvalId || (decision !== "approve" && decision !== "reject")) {
         throw new Error("Usage: approval <sessionId> <approvalId> <approve|reject> [--continue]");
       }
-      const settings = continueAfter ? loadBackendSettings() : undefined;
+      const settings = continueAfter ? await loadBackendSettings() : undefined;
       const actionPromise = actor.approveToolCall(sessionId, approvalId, decision, continueAfter, settings);
       if (continueAfter) {
         await watchSessionProgress(actor, sessionId, actionPromise);
@@ -910,7 +960,7 @@ async function main() {
       if (!project || prompts.length === 0) {
         throw new Error("Usage: parallel-run [--mode read-only|act|plan|yolo] <project> <prompt1> -- <prompt2> [-- <prompt3>...]");
       }
-      const settings = loadBackendSettings();
+      const settings = await loadBackendSettings();
       const session = await actor.createSession(`CLI parallel ${project}`);
       await actor.setSessionConfig(session.session.id, settings.model, "act");
       const actionPromise = actor.runParallelAgentTasks(
@@ -937,7 +987,7 @@ async function main() {
       if (!project || !filePath || !prompt) {
         throw new Error("Missing <project>, <path>, or <prompt...>");
       }
-      const settings = loadBackendSettings();
+      const settings = await loadBackendSettings();
       const session = await actor.createSession(`CLI ${project}`);
       await actor.setSessionConfig(session.session.id, settings.model, "act");
       console.log(

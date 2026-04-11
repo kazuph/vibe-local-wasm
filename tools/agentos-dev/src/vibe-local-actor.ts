@@ -947,7 +947,12 @@ async function callOpenAiCompatible(
   }
 
   if (!response.ok) {
-    throw new Error(`Agent request failed: ${await response.text()}`);
+    const errorBody = await response.text();
+    // Retry without tools if the model doesn't support function calling
+    if (includeTools && errorBody.includes("does not support tools")) {
+      return callOpenAiCompatible(settings, messages, false, toolSchemas);
+    }
+    throw new Error(`Agent request failed: ${errorBody}`);
   }
 
   const payload = (await response.json()) as {
@@ -2748,15 +2753,30 @@ export const vibeLocalActor = actor({
       const existing = await requireSnapshot(c.db, sessionId);
       const persistedUser = await persistMessage(c.db, sessionId, "user", prompt);
       const executionMode = sessionModeToExecutionMode(existing.session.mode);
-      return await executeAgentTurnWithProgress(
-        c.db,
-        existing,
-        persistedUser.message.content,
-        settings,
-        selectedProject,
-        executionMode,
-        0,
-      );
+      try {
+        return await executeAgentTurnWithProgress(
+          c.db,
+          existing,
+          persistedUser.message.content,
+          settings,
+          selectedProject,
+          executionMode,
+          0,
+        );
+      } catch (error) {
+        // Return error as structured response instead of throwing,
+        // because RivetKit converts thrown errors to opaque "Internal error".
+        const errorMessage = toErrorMessage(error);
+        return {
+          session: existing.session,
+          task: { status: "failed" as const, lastResponse: "", lastError: errorMessage, goal: prompt },
+          messages: existing.messages,
+          artifacts: existing.artifacts,
+          approvals: existing.approvals,
+          subAgents: existing.subAgents,
+          error: errorMessage,
+        };
+      }
     },
     continueAgentTask: async (c, sessionId: string, settings?: BackendSettings) => {
       const snapshot = await requireSnapshot(c.db, sessionId);
