@@ -5,6 +5,22 @@ import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline/promises";
 
 import { createAgentosClient, waitForManager, agentosEndpoint } from "./client.js";
+import {
+  FixedFooter,
+  bold,
+  cyan,
+  dim,
+  errorColor,
+  formatSubAgent,
+  formatToolEvent,
+  gray,
+  green,
+  infoColor,
+  promptColor,
+  red,
+  toolColor,
+  yellow,
+} from "./tui.js";
 
 type OpenCodeConfig = {
   provider?: Record<
@@ -80,6 +96,7 @@ async function watchSessionProgress(
   actor: Awaited<ReturnType<typeof getActor>>,
   sessionId: string,
   work: Promise<unknown>,
+  footer?: FixedFooter,
 ) {
   let settled = false;
   let lastAssistantText = "";
@@ -89,6 +106,8 @@ async function watchSessionProgress(
   void work.finally(() => {
     settled = true;
   });
+
+  footer?.update({ status: "generating…" });
 
   while (!settled) {
     const snapshot = (await actor.exportSession(sessionId)) as SessionSnapshot | null;
@@ -105,7 +124,14 @@ async function watchSessionProgress(
           continue;
         }
         seenToolEvents.add(artifact.id);
-        console.log(formatCliToolEvent(artifact.payload));
+        const payload = artifact.payload as Record<string, unknown>;
+        const toolName = typeof payload.name === "string" ? payload.name : "unknown";
+        const toolStatus = typeof payload.status === "string" ? payload.status : "running";
+        const toolInput = payload.input && typeof payload.input === "object" && !Array.isArray(payload.input)
+          ? summarizeCliToolInput(payload.input as Record<string, unknown>)
+          : undefined;
+        console.log(formatToolEvent(toolName, toolStatus, toolInput));
+        footer?.update({ status: `tool: ${toolName}` });
       }
 
       for (const subAgent of snapshot.subAgents) {
@@ -114,7 +140,7 @@ async function watchSessionProgress(
           continue;
         }
         seenSubAgentStates.set(subAgent.id, signature);
-        console.log(formatSubAgentLine(subAgent));
+        console.log(formatSubAgent(subAgent.id, subAgent.status, subAgent.prompt));
       }
 
       const partialText = snapshot.task?.status === "running" ? snapshot.task.lastResponse ?? "" : "";
@@ -143,6 +169,8 @@ async function watchSessionProgress(
   if (lastAssistantText) {
     process.stdout.write("\n");
   }
+
+  footer?.update({ status: "idle" });
 }
 
 async function watchExistingSession(
@@ -321,17 +349,24 @@ async function runInteractiveChat(
   await actor.setSessionConfig(session.session.id, settings.model, mode);
   const availableProjects = await actor.listProjects();
 
+  // Set up DECSTBM fixed footer
+  const footer = new FixedFooter({
+    model: settings.model,
+    mode,
+    project: currentProject,
+    sessionId: session.session.id.slice(0, 8),
+  });
+  footer.setup();
+
   const rl = createInterface({ input, output });
-  console.log(`[chat] session=${session.session.id} project=${currentProject} mode=${mode}`);
-  console.log(
-    "[chat] /help /mode <plan|act|yolo> /projects /project <name> /approvals /approve <id> [continue] /reject <id> /continue /subagents /continue-subagent <id> /parallel [mode] <p1> -- <p2> /session /exit",
-  );
+  console.log(infoColor(`session=${session.session.id.slice(0, 8)} project=${currentProject} mode=${mode}`));
+  console.log(gray("Type a message or use /help for commands."));
 
   try {
     while (true) {
       let rawLine = "";
       try {
-        rawLine = await rl.question(`${mode}:${currentProject}> `);
+        rawLine = await rl.question(promptColor(`${mode}:${currentProject}> `));
       } catch (error) {
         if (error instanceof Error && error.message.includes("readline was closed")) {
           break;
@@ -348,21 +383,89 @@ async function runInteractiveChat(
       }
 
       if (line === "/help") {
-        console.log(
-          "[chat] 通常入力は agent 実行です。/mode /projects /project /approvals /approve /reject /continue /subagents /continue-subagent /parallel /session /exit が使えます。",
-        );
+        console.log(bold("Available commands:"));
+        console.log(`  ${cyan("/help")}          Show this help`);
+        console.log(`  ${cyan("/exit")}          Exit session`);
+        console.log(`  ${cyan("/clear")}         Clear conversation`);
+        console.log(`  ${cyan("/plan")}          Enter Plan mode (read-only)`);
+        console.log(`  ${cyan("/approve")}       Switch to Act mode`);
+        console.log(`  ${cyan("/mode")} ${gray("<mode>")}   Set mode (plan/act/yolo)`);
+        console.log(`  ${cyan("/status")}        Show session info`);
+        console.log(`  ${cyan("/compact")}       Compress conversation history`);
+        console.log(`  ${cyan("/model")} ${gray("<name>")}  Switch model`);
+        console.log(`  ${cyan("/projects")}      List available projects`);
+        console.log(`  ${cyan("/project")} ${gray("<n>")}   Switch project`);
+        console.log(`  ${cyan("/approvals")}     Show pending approvals`);
+        console.log(`  ${cyan("/continue")}      Continue agent task`);
         continue;
       }
 
-      if (line.startsWith("/mode ")) {
-        const nextMode = line.slice("/mode ".length).trim();
+      if (line === "/clear") {
+        // Clear screen and reset conversation display
+        process.stdout.write("\x1b[2J\x1b[1;1H");
+        footer.setup(); // Re-draw footer after clear
+        console.log(infoColor("conversation display cleared"));
+        continue;
+      }
+
+      if (line === "/status") {
+        const snapshot = (await actor.exportSession(session.session.id)) as SessionSnapshot | null;
+        const msgCount = snapshot?.messages.length ?? 0;
+        const pendingCount = snapshot?.approvals.filter(
+          (a: SessionSnapshot["approvals"][number]) => a.status === "pending",
+        ).length ?? 0;
+        const subAgentCount = snapshot?.subAgents.length ?? 0;
+        console.log(bold("Session Status:"));
+        console.log(`  ${gray("session")}  ${session.session.id.slice(0, 8)}`);
+        console.log(`  ${gray("model")}    ${cyan(settings.model)}`);
+        console.log(`  ${gray("mode")}     ${mode}`);
+        console.log(`  ${gray("project")}  ${currentProject}`);
+        console.log(`  ${gray("messages")} ${msgCount}`);
+        if (pendingCount > 0) console.log(`  ${yellow(`approvals: ${pendingCount} pending`)}`);
+        if (subAgentCount > 0) console.log(`  ${gray(`sub-agents: ${subAgentCount}`)}`);
+        continue;
+      }
+
+      if (line === "/compact") {
+        try {
+          await actor.compactSession(session.session.id);
+          console.log(infoColor("session compacted"));
+        } catch (err) {
+          console.log(errorColor(`compact failed: ${err instanceof Error ? err.message : String(err)}`));
+        }
+        continue;
+      }
+
+      if (line.startsWith("/model ")) {
+        const nextModel = line.slice("/model ".length).trim();
+        if (!nextModel) {
+          console.log(yellow("/model <name>"));
+          continue;
+        }
+        settings.model = nextModel;
+        await actor.setSessionConfig(session.session.id, settings.model, mode);
+        footer.update({ model: nextModel });
+        console.log(infoColor(`model → ${nextModel}`));
+        continue;
+      }
+
+      if (line.startsWith("/mode ") || line === "/plan" || line === "/approve" || line === "/act") {
+        let nextMode: string;
+        if (line === "/plan") {
+          nextMode = "plan";
+        } else if (line === "/approve" || line === "/act") {
+          nextMode = "act";
+        } else {
+          nextMode = line.slice("/mode ".length).trim();
+        }
         if (nextMode !== "plan" && nextMode !== "act" && nextMode !== "yolo") {
-          console.log("[chat] mode は plan / act / yolo のみです");
+          console.log(yellow("mode は plan / act / yolo のみです"));
           continue;
         }
         mode = nextMode;
         await actor.setSessionConfig(session.session.id, settings.model, mode);
-        console.log(`[chat] mode を ${mode} に切り替えました`);
+        footer.update({ mode });
+        console.log(infoColor(`mode → ${mode}`));
         continue;
       }
 
@@ -389,7 +492,8 @@ async function runInteractiveChat(
           continue;
         }
         currentProject = nextProject;
-        console.log(`[chat] directory を ${currentProject} に切り替えました`);
+        footer.update({ project: currentProject });
+        console.log(infoColor(`directory → ${currentProject}`));
         continue;
       }
 
@@ -410,7 +514,7 @@ async function runInteractiveChat(
           continue;
         }
         const actionPromise = actor.continueSubAgentTask(session.session.id, subAgentId, settings);
-        await watchSessionProgress(actor, session.session.id, actionPromise);
+        await watchSessionProgress(actor, session.session.id, actionPromise, footer);
         const result = await actionPromise;
         console.log(`[sub-agent] ${result.subAgent.id} -> ${result.subAgent.status}`);
         printSubAgentSummary((await actor.exportSession(session.session.id)) as SessionSnapshot | null);
@@ -443,7 +547,7 @@ async function runInteractiveChat(
           currentProject,
           executionMode,
         );
-        await watchSessionProgress(actor, session.session.id, actionPromise);
+        await watchSessionProgress(actor, session.session.id, actionPromise, footer);
         const result = await actionPromise;
         console.log(
           `[parallel] started ${result.subAgents.length} sub-agents in ${executionMode} mode`,
@@ -474,9 +578,9 @@ async function runInteractiveChat(
 
       if (line === "/continue") {
         const runPromise = actor.continueAgentTask(session.session.id, settings);
-        await watchSessionProgress(actor, session.session.id, runPromise);
+        await watchSessionProgress(actor, session.session.id, runPromise, footer);
         const result = await runPromise;
-        console.log(`[task] status=${result.task?.status ?? "unknown"}`);
+        console.log(dim(`task: ${result.task?.status ?? "unknown"}`));
         printPendingApprovals((await actor.exportSession(session.session.id)) as SessionSnapshot | null);
         continue;
       }
@@ -499,7 +603,7 @@ async function runInteractiveChat(
           continueAfter ? settings : undefined,
         );
         if (continueAfter) {
-          await watchSessionProgress(actor, session.session.id, actionPromise);
+          await watchSessionProgress(actor, session.session.id, actionPromise, footer);
         }
         const result = await actionPromise;
         console.log(`[approval] ${result.approval.toolName} -> ${result.approval.status}`);
@@ -520,12 +624,13 @@ async function runInteractiveChat(
       }
 
       const runPromise = actor.runAgentTurn(session.session.id, line, settings, currentProject);
-      await watchSessionProgress(actor, session.session.id, runPromise);
+      await watchSessionProgress(actor, session.session.id, runPromise, footer);
       const result = await runPromise;
-      console.log(`[task] status=${result.task.status}`);
+      console.log(dim(`task: ${result.task.status}`));
       printPendingApprovals((await actor.exportSession(session.session.id)) as SessionSnapshot | null);
     }
   } finally {
+    footer.teardown();
     rl.close();
   }
 }
