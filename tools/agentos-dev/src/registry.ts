@@ -124,7 +124,7 @@ export const registry = setup({
   storagePath: path.join(TOOL_ROOT, ".agentos-dev", "rivetkit"),
   noWelcome: true,
   logging: {
-    level: process.env.AGENTOS_DEBUG === "1" ? "debug" : "info",
+    level: process.env.AGENTOS_DEBUG === "1" ? "debug" : "warn",
   },
   use: {
     workspaceVm,

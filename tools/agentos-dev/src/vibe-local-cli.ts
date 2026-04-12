@@ -4,7 +4,10 @@ import path from "node:path";
 import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline/promises";
 
-import { createAgentosClient, waitForManager, agentosEndpoint } from "./client.js";
+import { createClient } from "rivetkit/client";
+
+import { AGENTOS_PORT } from "./config.js";
+import { registry } from "./registry.js";
 import {
   FixedFooter,
   bold,
@@ -276,10 +279,20 @@ function usage() {
   pnpm vibe-local:cli agent-rewrite-file <project> <path> <prompt...>`);
 }
 
+let managerStarted = false;
+
+async function ensureManager() {
+  if (managerStarted) return;
+  registry.start();
+  managerStarted = true;
+  // Give the HTTP server a moment to bind
+  await new Promise((resolve) => setTimeout(resolve, 300));
+}
+
 async function getActor() {
-  const endpoint = agentosEndpoint();
-  await waitForManager(endpoint);
-  const client = createAgentosClient();
+  await ensureManager();
+  const endpoint = `http://127.0.0.1:${AGENTOS_PORT}`;
+  const client = createClient(endpoint) as any;
   return client.vibeLocal.getOrCreate(["browser-core"]);
 }
 
