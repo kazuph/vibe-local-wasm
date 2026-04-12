@@ -334,7 +334,6 @@ function printPendingApprovals(snapshot: SessionSnapshot | null) {
     snapshot?.approvals.filter((approval: SessionSnapshot["approvals"][number]) => approval.status === "pending") ??
     [];
   if (approvals.length === 0) {
-    console.log("[approvals] pending approval はありません");
     return;
   }
 
