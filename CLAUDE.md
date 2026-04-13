@@ -32,26 +32,67 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Pyodide ランタイム（実装済み）
 
-`pyodide-chat` サブコマンドは、本家 `vibe-coder.py` を Pyodide (WASM) にロードして実際に実行する。
+本家 `vibe-coder.py` (8221行) を Pyodide (WASM) にロードし、**agentOS actor.runAgentTurn** 経由で実行する。
+
+### 起動方法
+
+デフォルトは TypeScript の `runAgentLoop` パスだが、`VIBE_LOCAL_PYODIDE=1` を設定すると Pyodide 経由 (vibe-coder.py) になる:
+
+```bash
+VIBE_LOCAL_PYODIDE=1 pnpm run cli -- chat vibe-local-pyodide --mode yolo
+```
+
+### 実行経路
 
 ```
-CLI (pyodide-chat) → pyodide-runtime.ts → Pyodide → vibe-coder.py
-                                                    ├── OllamaClient.chat()
-                                                    └── urllib.request (bridged)
-                                                         ↓
-                                                    JS curl execSync → LLM
+CLI → actor.runAgentTurn(prompt)
+        ↓
+     persistMessage(user)                     [actor DB]
+        ↓
+     [VIBE_LOCAL_PYODIDE=1] executePyodideAgentTurn
+        ↓
+     pyodideRunAgentTurn(messages, settings)  [pyodide-runtime.ts]
+        ↓
+     Pyodide WASM
+        ├── vibe-coder.py OllamaClient.chat()
+        │     └── urllib.request → JS curl bridge → LLM
+        └── vibe-coder.py ToolRegistry
+              └── tool.execute → _js_tool_dispatch → JS (Bash/Read/Write/Glob/Grep/WebFetch)
+        ↓
+     tool events + final response → actor
+        ↓
+     persistAgentToolEvent / persistMessage / saveTaskState  [actor DB]
+        ↓
+     return AgentTurnResult                   → CLI
 ```
 
-主要ファイル:
-- `tools/agentos-dev/src/pyodide-runtime.ts` — Pyodide 初期化、urllib/subprocess bridge、`pyodideChat()` API
-- `tools/agentos-dev/src/pyodide-core/vibe-coder.py` — 本家 ochyai/vibe-local のコード（8221行、そのまま）
+### 主要ファイル
 
-Pyodideで動かすために必要だったパッチ:
-- `urllib.request.urlopen` → JS bridge（curl execSync 経由の同期HTTP）
-- `subprocess.run`/`check_output` → JS bridge（Node child_process execFileSync 経由）
-- `OllamaClient._native_to_openai_response` → llama.cpp/vLLM の OpenAI-format レスポンスも pass-through
+- `tools/agentos-dev/src/pyodide-runtime.ts` — Pyodide 初期化、ブリッジ、`pyodideRunAgentTurn`/`pyodideChat`/`pyodideToolCallViaBridge` API
+- `tools/agentos-dev/src/pyodide-core/vibe-coder.py` — 本家 ochyai/vibe-local、8221行 **無改変**
+- `tools/agentos-dev/src/vibe-local-actor.ts::executePyodideAgentTurn` — actor からの橋渡し
 
-初回ロードは ~1.5 秒（Pyodide 起動 + sqlite3 package + vibe-coder.py パース）、以後は プロセス内キャッシュ。
+### Pyodide で動かすためのパッチ（全て runtime の `py.runPython` で実行時注入）
+
+| 対象 | 内容 |
+|------|------|
+| `urllib.request.urlopen` | `curl` execSync JS bridge で同期HTTP |
+| `subprocess.run/check_output/Popen` | `child_process.execFileSync` JS bridge、Popen は同期シム |
+| `os.getpgid/killpg` | no-op（Popen シムのクリーンアップ互換用） |
+| `OllamaClient._native_to_openai_response` | OpenAI-format レスポンス pass-through（llama.cpp/vLLM 互換） |
+| `OllamaClient._prepare_messages_for_native` | tool_call に `type: "function"` を保持（llama.cpp が要求） |
+| `ToolRegistry._tools[*].execute` | 全ツールの execute を `_js_tool_dispatch` にバインド（Option C: JS bridge 経由） |
+
+### ブリッジ経由のツール (`_js_tool_dispatch`)
+
+`Bash` / `Read` / `Write` / `Edit` / `Glob` / `Grep` / `WebFetch` は JS 側で同期的に実行。vibe-coder.py の Python 実装は呼び出されない（Tool クラスのインスタンスは存在するが、execute だけ差し替え）。
+
+### パフォーマンス
+
+- 初回ロード: ~1.5 秒（Pyodide 起動 + sqlite3 パッケージ + vibe-coder.py パース）
+- 以後はプロセス内キャッシュ（`pyPromise` シングルトン）
+- 単純な1ツール agent turn: ~2秒（LLM 2 iter + tool 実行）
+- multi-tool (Glob + Read + 要約): ~5秒 (3 iter)
 
 ## Monorepo Structure
 
