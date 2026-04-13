@@ -9,16 +9,51 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { REPO_ROOT } from "./config.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const VIBE_CODER_PATH = path.resolve(__dirname, "pyodide-core/vibe-coder.py");
 
+/**
+ * Resolve a tool-provided path against the repo root. Mirrors the behavior
+ * of resolveRepoPath in vibe-local-actor.ts but tolerates absolute paths
+ * that already live inside the repo.
+ */
+function resolveHostPath(raw: string): string {
+  if (!raw) throw new Error("Empty path");
+  const abs = path.isAbsolute(raw) ? raw : path.resolve(REPO_ROOT, raw);
+  // Basic guard: don't let tool paths escape the repo
+  if (!abs.startsWith(REPO_ROOT) && !abs.startsWith("/tmp/")) {
+    // Relaxed: still allow /tmp for tests, but reject arbitrary system paths
+    throw new Error(`Path outside repo root is not allowed: ${raw}`);
+  }
+  return abs;
+}
+
 let pyPromise: Promise<unknown> | null = null;
+
+/**
+ * Tool dispatcher — JS-side handler for Python tool calls.
+ * The caller (e.g. actor) provides this when calling runPyodideAgentTurn.
+ * Returns a JSON-serializable result that Python will wrap as the tool output.
+ */
+export type ToolDispatcher = (
+  toolName: string,
+  params: Record<string, unknown>,
+) => Promise<{ ok: boolean; output?: string; error?: string }>;
+
+// Currently installed dispatcher (set per call). Initialized to a stub
+// that just reports "no dispatcher" to Python.
+let currentDispatcher: ToolDispatcher = async (name) => ({
+  ok: false,
+  error: `No tool dispatcher registered for '${name}'`,
+});
 
 async function initPyodide() {
   if (pyPromise) return pyPromise;
@@ -92,9 +127,14 @@ async function initPyodide() {
         return JSON.stringify({ ok: false, stdout: "", stderr: "Empty argv", exit_code: null });
       }
       const [cmd, ...cmdArgs] = argv;
+      // Pyodide's os.getcwd() returns virtual paths like /home/pyodide that
+      // don't exist on the host. Fall back to undefined (Node's cwd) if the
+      // requested cwd is empty OR not a real directory on the host.
+      const effectiveCwd =
+        cwd && cwd.length > 0 && existsSync(cwd) ? cwd : undefined;
       try {
         const stdout = execFileSync(cmd, cmdArgs, {
-          cwd: cwd || undefined,
+          cwd: effectiveCwd,
           encoding: "utf8",
           maxBuffer: 32 * 1024 * 1024,
           timeout: timeoutMs > 0 ? timeoutMs : 60_000,
@@ -116,6 +156,176 @@ async function initPyodide() {
       }
     };
     py.globals.set("_js_exec_sync", jsExecSync);
+
+    // --- JS bridge: synchronous tool dispatch (Option C) -------------------
+    //
+    // vibe-coder.py's ToolRegistry is monkey-patched so every tool.execute
+    // calls this function. Arguments are the Python tool name (e.g. "Bash",
+    // "Read") and a JSON-encoded params dict. Result must be a JSON string
+    // with { ok, output, error? }.
+    //
+    // Python's tool.execute is synchronous, so this function must return
+    // synchronously. For now we implement the handlers directly here using
+    // execFileSync / readFileSync / writeFileSync / curl, reusing the
+    // existing TS tool helpers where they happen to be sync-compatible.
+
+    const jsToolDispatch = (name: string, paramsJson: string): string => {
+      let params: Record<string, unknown> = {};
+      try {
+        const parsed = JSON.parse(paramsJson);
+        if (parsed && typeof parsed === "object") params = parsed as Record<string, unknown>;
+      } catch (err) {
+        return JSON.stringify({
+          ok: false,
+          error: `Bad params JSON: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+
+      try {
+        switch (name) {
+          case "Bash": {
+            const cmd = String(params.command ?? "");
+            if (!cmd) return JSON.stringify({ ok: false, error: "No command" });
+            const timeoutMs = Number(params.timeout ?? 120_000);
+            try {
+              const stdout = execFileSync("sh", ["-c", cmd], {
+                cwd: REPO_ROOT,
+                encoding: "utf8",
+                maxBuffer: 32 * 1024 * 1024,
+                timeout: timeoutMs > 0 ? timeoutMs : 120_000,
+              });
+              return JSON.stringify({ ok: true, output: stdout.trim() || "(no output)" });
+            } catch (err) {
+              const e = err as {
+                stdout?: Buffer | string;
+                stderr?: Buffer | string;
+                code?: number;
+                message?: string;
+              };
+              const so = typeof e.stdout === "string" ? e.stdout : e.stdout?.toString("utf8") ?? "";
+              const se = typeof e.stderr === "string" ? e.stderr : e.stderr?.toString("utf8") ?? e.message ?? "";
+              const rc = typeof e.code === "number" ? e.code : -1;
+              return JSON.stringify({
+                ok: true, // non-zero exit is still a "successful" tool run in agent semantics
+                output: [so, se].filter(Boolean).join("\n") + `\n(exit code: ${rc})`,
+              });
+            }
+          }
+          case "Read": {
+            const filePath = resolveHostPath(String(params.file_path ?? ""));
+            const offset = Number(params.offset ?? 0);
+            const limit = Number(params.limit ?? 2000);
+            const content = readFileSync(filePath, "utf8");
+            const lines = content.split("\n");
+            const sliced = lines.slice(offset, offset + limit);
+            // Match cat -n format
+            const numbered = sliced
+              .map((line, i) => `${String(offset + i + 1).padStart(6)}\t${line}`)
+              .join("\n");
+            return JSON.stringify({ ok: true, output: numbered });
+          }
+          case "Write": {
+            const filePath = resolveHostPath(String(params.file_path ?? ""));
+            const content = String(params.content ?? "");
+            mkdirSync(path.dirname(filePath), { recursive: true });
+            writeFileSync(filePath, content, "utf8");
+            return JSON.stringify({
+              ok: true,
+              output: `Wrote ${content.length} chars to ${path.relative(REPO_ROOT, filePath) || filePath}`,
+            });
+          }
+          case "Edit": {
+            const filePath = resolveHostPath(String(params.file_path ?? ""));
+            const oldStr = String(params.old_string ?? "");
+            const newStr = String(params.new_string ?? "");
+            const replaceAll = Boolean(params.replace_all);
+            if (!oldStr) return JSON.stringify({ ok: false, error: "old_string is required" });
+            const before = readFileSync(filePath, "utf8");
+            if (!before.includes(oldStr)) {
+              return JSON.stringify({ ok: false, error: `old_string not found in ${filePath}` });
+            }
+            const after = replaceAll ? before.split(oldStr).join(newStr) : before.replace(oldStr, newStr);
+            writeFileSync(filePath, after, "utf8");
+            return JSON.stringify({ ok: true, output: `Edited ${path.relative(REPO_ROOT, filePath) || filePath}` });
+          }
+          case "Glob": {
+            const pattern = String(params.pattern ?? "");
+            if (!pattern) return JSON.stringify({ ok: false, error: "pattern required" });
+            // Use rg --files --glob for a sync glob
+            try {
+              const stdout = execFileSync(
+                "rg",
+                ["--files", "--hidden", "--glob", pattern, "--glob", "!**/node_modules/**", "--glob", "!**/.git/**"],
+                { cwd: REPO_ROOT, encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 20_000 },
+              );
+              const files = stdout.split("\n").filter(Boolean).slice(0, 100);
+              return JSON.stringify({ ok: true, output: files.join("\n") || "(no matches)" });
+            } catch (err) {
+              const e = err as { code?: number; message?: string };
+              if (e.code === 1) return JSON.stringify({ ok: true, output: "(no matches)" });
+              return JSON.stringify({ ok: false, error: e.message ?? String(err) });
+            }
+          }
+          case "Grep": {
+            const pattern = String(params.pattern ?? "");
+            if (!pattern) return JSON.stringify({ ok: false, error: "pattern required" });
+            const rgArgs = ["-n", "--hidden", "--glob", "!**/node_modules/**", "--glob", "!**/.git/**"];
+            if (params.path) rgArgs.push("-g", String(params.path));
+            rgArgs.push(pattern, REPO_ROOT);
+            try {
+              const stdout = execFileSync("rg", rgArgs, {
+                cwd: REPO_ROOT,
+                encoding: "utf8",
+                maxBuffer: 16 * 1024 * 1024,
+                timeout: 20_000,
+              });
+              const lines = stdout.split("\n").filter(Boolean).slice(0, 50);
+              return JSON.stringify({ ok: true, output: lines.join("\n") || "(no matches)" });
+            } catch (err) {
+              const e = err as { code?: number; message?: string };
+              if (e.code === 1) return JSON.stringify({ ok: true, output: "(no matches)" });
+              return JSON.stringify({ ok: false, error: e.message ?? String(err) });
+            }
+          }
+          case "WebFetch": {
+            const url = String(params.url ?? "");
+            if (!url) return JSON.stringify({ ok: false, error: "url required" });
+            try {
+              const out = execFileSync(
+                "curl",
+                ["-s", "-L", "--max-time", "30", "-A", "vibe-local-wasm/1.0", url],
+                { encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 35_000 },
+              );
+              // Strip HTML tags crudely for agent readability
+              const text = out
+                .replace(/<script[\s\S]*?<\/script>/gi, "")
+                .replace(/<style[\s\S]*?<\/style>/gi, "")
+                .replace(/<[^>]+>/g, " ")
+                .replace(/\s+/g, " ")
+                .trim()
+                .slice(0, 5000);
+              return JSON.stringify({ ok: true, output: text || "(empty)" });
+            } catch (err) {
+              return JSON.stringify({
+                ok: false,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+          default:
+            return JSON.stringify({
+              ok: false,
+              error: `Tool '${name}' is not yet bridged to JS. Python-side execution would be used.`,
+            });
+        }
+      } catch (err) {
+        return JSON.stringify({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    };
+    py.globals.set("_js_tool_dispatch", jsToolDispatch);
 
     // --- Install Python-side bridges and load vibe_coder.py ----------------
 
@@ -167,10 +377,33 @@ def _bridged_urlopen(req, data=None, timeout=None, **kw):
 urllib.request.urlopen = _bridged_urlopen
 
 # --- subprocess bridge -----------------------------------------------------
-# Monkey-patch subprocess.run / subprocess.check_output / Popen to route
-# through the JS bridge. vibe-coder.py heavily uses subprocess for Bash,
-# Git, ripgrep, etc.
+# Monkey-patch subprocess.run / check_output / Popen to route through the
+# JS bridge. vibe-coder.py heavily uses subprocess (Bash, Git, rg, etc.).
+#
+# Popen is patched as a synchronous shim: __init__ runs the command via the
+# JS bridge immediately, caches the result, and subsequent communicate()/
+# wait()/poll() calls return the cached values. This is sufficient for
+# BashTool's usage pattern which always calls communicate() right after.
 import subprocess as _sp
+import os as _os
+
+_PIPE = _sp.PIPE
+_DEVNULL = _sp.DEVNULL
+
+def _coerce_argv(args, shell=False):
+    if shell:
+        if isinstance(args, (list, tuple)):
+            args = ' '.join(str(a) for a in args)
+        return ['sh', '-c', str(args)]
+    if isinstance(args, str):
+        return args.split()
+    return [str(a) for a in args]
+
+def _invoke_js_exec(args, cwd=None, shell=False, timeout=None):
+    argv = _coerce_argv(args, shell)
+    timeout_ms = int(timeout * 1000) if timeout else 60_000
+    raw = _js_exec_sync(json.dumps(argv), str(cwd or ''), timeout_ms)
+    return json.loads(raw)
 
 class _BridgedCompletedProcess:
     def __init__(self, args, returncode, stdout, stderr):
@@ -179,58 +412,99 @@ class _BridgedCompletedProcess:
         self.stdout = stdout
         self.stderr = stderr
 
-def _coerce_argv(args, shell=False):
-    if shell:
-        # shell=True passes a single string; wrap with sh -c
-        if isinstance(args, (list, tuple)):
-            args = ' '.join(str(a) for a in args)
-        return ['sh', '-c', str(args)]
-    if isinstance(args, str):
-        # subprocess.run('ls -la', shell=False) is unusual but handle it
-        return args.split()
-    return [str(a) for a in args]
-
 def _bridged_run(args, **kwargs):
-    argv = _coerce_argv(args, kwargs.get('shell', False))
-    cwd = kwargs.get('cwd') or ''
-    timeout = kwargs.get('timeout')
-    timeout_ms = int(timeout * 1000) if timeout else 60_000
-    result_json = _js_exec_sync(json.dumps(argv), str(cwd), timeout_ms)
-    result = json.loads(result_json)
-    check = kwargs.get('check', False)
-    capture = kwargs.get('capture_output', False)
-    want_text = kwargs.get('text', False) or kwargs.get('universal_newlines', False)
-    rc = result.get('exit_code')
-    if rc is None:
-        rc = -1
+    result = _invoke_js_exec(
+        args, cwd=kwargs.get('cwd'), shell=kwargs.get('shell', False),
+        timeout=kwargs.get('timeout'),
+    )
+    rc = result.get('exit_code') if result.get('exit_code') is not None else -1
     stdout = result.get('stdout', '') or ''
     stderr = result.get('stderr', '') or ''
-    if not (capture or kwargs.get('stdout') == _sp.PIPE):
-        stdout_out = None
-    else:
-        stdout_out = stdout if want_text else stdout.encode('utf-8')
-    if not (capture or kwargs.get('stderr') == _sp.PIPE):
-        stderr_out = None
-    else:
-        stderr_out = stderr if want_text else stderr.encode('utf-8')
-    cp = _BridgedCompletedProcess(args, rc, stdout_out, stderr_out)
-    if check and rc != 0:
-        err = _sp.CalledProcessError(rc, args, output=stdout_out, stderr=stderr_out)
-        raise err
+    want_text = kwargs.get('text', False) or kwargs.get('universal_newlines', False)
+    capture = kwargs.get('capture_output', False)
+    so = (stdout if want_text else stdout.encode('utf-8')) if (capture or kwargs.get('stdout') == _PIPE) else None
+    se = (stderr if want_text else stderr.encode('utf-8')) if (capture or kwargs.get('stderr') == _PIPE) else None
+    cp = _BridgedCompletedProcess(args, rc, so, se)
+    if kwargs.get('check') and rc != 0:
+        raise _sp.CalledProcessError(rc, args, output=so, stderr=se)
     return cp
 
 def _bridged_check_output(args, **kwargs):
     kwargs['capture_output'] = True
     kwargs['check'] = True
-    cp = _bridged_run(args, **kwargs)
-    return cp.stdout
+    return _bridged_run(args, **kwargs).stdout
 
 _sp.run = _bridged_run
 _sp.check_output = _bridged_check_output
 
-# Note: Popen is not patched. vibe-coder.py uses it for long-running
-# processes (MCP servers, sandbox agents). Those features are skipped
-# for this initial Pyodide integration.
+class _BridgedPopen:
+    """Synchronous shim for subprocess.Popen.
+
+    Runs the command immediately in __init__ via the JS bridge and caches
+    the result. communicate(), wait(), and poll() return the cached output.
+    This is NOT a true async process — it's a synchronous execution that
+    mimics the Popen API for callers that use communicate() immediately.
+    """
+
+    def __init__(self, args, **kwargs):
+        self.args = args
+        self._kwargs = kwargs
+        self._text = kwargs.get('text', False) or kwargs.get('universal_newlines', False)
+        shell = kwargs.get('shell', False)
+        cwd = kwargs.get('cwd')
+        timeout = kwargs.get('timeout')
+        # Execute right now
+        result = _invoke_js_exec(args, cwd=cwd, shell=shell, timeout=timeout)
+        rc = result.get('exit_code') if result.get('exit_code') is not None else -1
+        stdout_str = result.get('stdout', '') or ''
+        stderr_str = result.get('stderr', '') or ''
+        self.returncode = rc
+        self.pid = 0
+        if self._text:
+            self._stdout_buf = stdout_str
+            self._stderr_buf = stderr_str
+        else:
+            self._stdout_buf = stdout_str.encode('utf-8')
+            self._stderr_buf = stderr_str.encode('utf-8')
+        self.stdout = None
+        self.stderr = None
+        self.stdin = None
+
+    def communicate(self, input=None, timeout=None):
+        return (self._stdout_buf, self._stderr_buf)
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        pass
+
+    def terminate(self):
+        pass
+
+    def send_signal(self, sig):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+_sp.Popen = _BridgedPopen
+
+# Stub os.killpg / os.getpgid — the BashTool uses these in timeout cleanup
+# but our _BridgedPopen never actually spawns a process, so these should
+# be no-ops (and the caller already handles ProcessLookupError).
+def _noop_getpgid(pid):
+    return 0
+def _noop_killpg(pgid, sig):
+    pass
+_os.getpgid = _noop_getpgid
+_os.killpg = _noop_killpg
 
 # --- Load vibe_coder.py ----------------------------------------------------
 import importlib.util
@@ -247,9 +521,59 @@ def _smart_adapter(data):
     return _orig_adapter(data)
 _mod.OllamaClient._native_to_openai_response = staticmethod(_smart_adapter)
 
-# Expose module to subsequent runPython calls
+# --- Patch message preparation to preserve OpenAI tool_call shape ----------
+# vibe-coder.py's _prepare_messages_for_native drops the "type": "function"
+# field from tool_calls, which llama.cpp's /api/chat endpoint rejects with
+# "Missing tool call type". We reinstate it after the original prep runs.
+_orig_prepare = _mod.OllamaClient._prepare_messages_for_native
+def _patched_prepare(messages):
+    prepared = _orig_prepare(messages)
+    for msg in prepared:
+        tool_calls = msg.get('tool_calls')
+        if tool_calls:
+            for tc in tool_calls:
+                if isinstance(tc, dict) and 'type' not in tc:
+                    tc['type'] = 'function'
+    return prepared
+_mod.OllamaClient._prepare_messages_for_native = staticmethod(_patched_prepare)
+
+# --- ToolRegistry bridge ---------------------------------------------------
+# Replace each registered tool's execute() method with a JS dispatcher.
+# This is the core of Option C: vibe-coder.py's Agent loop runs as usual,
+# but every tool call round-trips to JS for the actual work.
+import types as _types
+
+def _make_bridge_execute(tool_name):
+    def _bridge_execute(self, params):
+        # Params may be a JsProxy from the LLM; convert to a plain dict
+        if hasattr(params, 'to_py'):
+            params = params.to_py()
+        elif not isinstance(params, dict):
+            params = dict(params) if params else {}
+        raw = _js_tool_dispatch(tool_name, json.dumps(params, default=str))
+        try:
+            result = json.loads(raw)
+        except Exception:
+            return f"Error: invalid dispatch result: {raw[:200]}"
+        if result.get('ok'):
+            out = result.get('output', '')
+            if not isinstance(out, str):
+                out = json.dumps(out)
+            return out
+        return f"Error ({tool_name}): {result.get('error', 'unknown error')}"
+    return _bridge_execute
+
+def install_tool_bridge(registry):
+    """Replace every tool.execute in this registry with a JS-bridged version."""
+    for name, tool_instance in list(registry._tools.items()):
+        bridged = _make_bridge_execute(name)
+        tool_instance.execute = _types.MethodType(bridged, tool_instance)
+    return registry
+
+# Expose module + helpers to subsequent runPython calls
 import builtins
 builtins.vibe_coder = _mod
+builtins.install_tool_bridge = install_tool_bridge
 builtins._vlw_bridge_ready = True
 `);
     return py;
@@ -350,4 +674,258 @@ export function isPyodideReady(): boolean {
 /** Kick off Pyodide loading in the background without awaiting. */
 export function prewarmPyodide(): void {
   void initPyodide();
+}
+
+// ----------------------------------------------------------------------------
+// Tool execution via vibe-coder.py's own tool classes.
+// This exists primarily for testing/debugging — the real integration path
+// uses ToolRegistry with a JS dispatch bridge (see runPyodideAgentTurn).
+// ----------------------------------------------------------------------------
+
+export type PyodideToolCallResult = {
+  ok: boolean;
+  output: string;
+  error?: string;
+};
+
+/**
+ * Execute one of vibe-coder.py's built-in Tool subclasses (Bash, Read, Write,
+ * Glob, Grep, etc.) directly inside Pyodide via its native Python execute().
+ * Used to verify that the subprocess/file bridge is working end-to-end.
+ */
+export async function pyodideToolCall(
+  toolClassName: string,
+  params: Record<string, unknown>,
+): Promise<PyodideToolCallResult> {
+  const py = (await initPyodide()) as {
+    globals: { set: (name: string, value: unknown) => void };
+    runPython: (code: string) => unknown;
+  };
+  py.globals.set(
+    "_tool_call_input",
+    JSON.stringify({ className: toolClassName, params }),
+  );
+  const resultJson = py.runPython(`
+import json, builtins, traceback
+mod = builtins.vibe_coder
+inp = json.loads(_tool_call_input)
+try:
+    cls = getattr(mod, inp['className'])
+    instance = cls()
+    output = instance.execute(inp['params'])
+    if not isinstance(output, str):
+        output = str(output)
+    _res = {'ok': True, 'output': output}
+except Exception as e:
+    _res = {'ok': False, 'output': '', 'error': f'{type(e).__name__}: {e}', 'traceback': traceback.format_exc()}
+json.dumps(_res)
+`) as string;
+  return JSON.parse(resultJson) as PyodideToolCallResult;
+}
+
+export type PyodideAgentTurnInput = {
+  baseUrl: string;
+  model: string;
+  messages: PyodideChatMessage[];
+  maxTokens?: number;
+  temperature?: number;
+  maxIterations?: number;
+  /** Restrict tool registry to these names. Undefined → all defaults. */
+  allowedTools?: string[];
+};
+
+export type PyodideToolEvent = {
+  name: string;
+  args: Record<string, unknown>;
+  output: string;
+};
+
+export type PyodideAgentTurnResult = {
+  ok: boolean;
+  content: string;
+  iterations: number;
+  toolEvents: PyodideToolEvent[];
+  error?: string;
+};
+
+/**
+ * Run a full tool-enabled agent turn through vibe-coder.py's OllamaClient
+ * and ToolRegistry. The ToolRegistry is bridged to JS so every tool.execute
+ * call round-trips through _js_tool_dispatch (Option C).
+ *
+ * This is a simplified loop — it does NOT use vibe-coder.py's full Agent
+ * class (which includes plan mode, RAG, checkpoints, etc.). Instead it
+ * reuses the core pieces: OllamaClient for LLM, ToolRegistry for tools,
+ * and implements the loop in Python via runPython.
+ */
+export async function pyodideRunAgentTurn(
+  input: PyodideAgentTurnInput,
+): Promise<PyodideAgentTurnResult> {
+  const py = (await initPyodide()) as {
+    globals: { set: (name: string, value: unknown) => void };
+    runPython: (code: string) => unknown;
+  };
+  py.globals.set(
+    "_agent_turn_input",
+    JSON.stringify({
+      baseUrl: input.baseUrl,
+      model: input.model,
+      messages: input.messages,
+      max_tokens: input.maxTokens ?? 2048,
+      temperature: input.temperature ?? 0.2,
+      max_iterations: input.maxIterations ?? 8,
+      allowed_tools: input.allowedTools ?? null,
+    }),
+  );
+  const resultJson = py.runPython(`
+import json, builtins, traceback
+mod = builtins.vibe_coder
+install = builtins.install_tool_bridge
+inp = json.loads(_agent_turn_input)
+
+try:
+    # Build config + client
+    cfg = mod.Config()
+    cfg.ollama_host = inp['baseUrl']
+    cfg.model = inp['model']
+    cfg.sidecar_model = inp['model']
+    cfg.debug = False
+    if hasattr(cfg, 'max_tokens'):
+        cfg.max_tokens = int(inp['max_tokens'])
+    if hasattr(cfg, 'temperature'):
+        cfg.temperature = float(inp['temperature'])
+
+    # Fresh bridged registry per turn
+    registry = mod.ToolRegistry().register_defaults()
+    install(registry)
+    all_schemas = registry.get_schemas()
+    allowed = inp.get('allowed_tools')
+    if allowed is None:
+        tools_schema = all_schemas
+    else:
+        allowed_set = set(allowed)
+        tools_schema = [s for s in all_schemas if s['function']['name'] in allowed_set]
+
+    client = mod.OllamaClient(cfg)
+    current = list(inp['messages'])
+    tool_events = []
+    max_iter = int(inp.get('max_iterations', 8))
+
+    final_content = ''
+    iterations = 0
+    for i in range(max_iter):
+        iterations = i + 1
+        resp = client.chat(
+            model=inp['model'],
+            messages=current,
+            tools=tools_schema if tools_schema else None,
+            stream=False,
+        )
+        msg = resp.get('choices', [{}])[0].get('message', {}) or {}
+        tool_calls = msg.get('tool_calls') or []
+
+        if not tool_calls:
+            final_content = msg.get('content', '') or ''
+            break
+
+        # Record the assistant message so the LLM can reference tool_calls
+        current.append({
+            'role': 'assistant',
+            'content': msg.get('content', '') or '',
+            'tool_calls': tool_calls,
+        })
+
+        # Execute each tool via the bridged registry
+        for tc in tool_calls:
+            fn = tc.get('function', {}) or {}
+            name = fn.get('name', '')
+            raw_args = fn.get('arguments', '{}') or '{}'
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except Exception:
+                args = {'_raw': raw_args}
+            tool = registry.get(name)
+            if tool is None:
+                output = f"Error: no tool named '{name}'"
+            else:
+                try:
+                    output = tool.execute(args)
+                    if not isinstance(output, str):
+                        output = str(output)
+                except Exception as e:
+                    output = f'Error: {type(e).__name__}: {e}'
+            tool_events.append({
+                'name': name,
+                'args': args,
+                'output': output[:1000] if len(output) > 1000 else output,
+            })
+            current.append({
+                'role': 'tool',
+                'tool_call_id': tc.get('id', f'call_{len(tool_events)}'),
+                'name': name,
+                'content': output,
+            })
+    else:
+        final_content = '(max iterations reached)'
+
+    _res = {
+        'ok': True,
+        'content': final_content,
+        'iterations': iterations,
+        'toolEvents': tool_events,
+    }
+except Exception as e:
+    _res = {
+        'ok': False,
+        'content': '',
+        'iterations': 0,
+        'toolEvents': [],
+        'error': f'{type(e).__name__}: {e}',
+        'traceback': traceback.format_exc(),
+    }
+json.dumps(_res, default=str)
+`) as string;
+  return JSON.parse(resultJson) as PyodideAgentTurnResult;
+}
+
+/**
+ * Execute a tool through vibe-coder.py's ToolRegistry AFTER installing the
+ * JS bridge. This is the "Option C" path — the Python tool instance's
+ * execute() method is replaced at runtime with a call to _js_tool_dispatch,
+ * which lets JS decide how to handle every tool the Agent invokes.
+ *
+ * Used to validate the bridge end-to-end before wiring Agent.run() in.
+ */
+export async function pyodideToolCallViaBridge(
+  toolName: string,
+  params: Record<string, unknown>,
+): Promise<PyodideToolCallResult> {
+  const py = (await initPyodide()) as {
+    globals: { set: (name: string, value: unknown) => void };
+    runPython: (code: string) => unknown;
+  };
+  py.globals.set(
+    "_bridge_tool_input",
+    JSON.stringify({ name: toolName, params }),
+  );
+  const resultJson = py.runPython(`
+import json, builtins, traceback
+mod = builtins.vibe_coder
+install = builtins.install_tool_bridge
+inp = json.loads(_bridge_tool_input)
+try:
+    # Build a fresh registry with defaults, then install the bridge
+    registry = mod.ToolRegistry().register_defaults()
+    install(registry)
+    tool = registry.get(inp['name'])
+    if tool is None:
+        _res = {'ok': False, 'output': '', 'error': f"No tool named '{inp['name']}'"}
+    else:
+        output = tool.execute(inp['params'])
+        _res = {'ok': True, 'output': output if isinstance(output, str) else str(output)}
+except Exception as e:
+    _res = {'ok': False, 'output': '', 'error': f'{type(e).__name__}: {e}', 'traceback': traceback.format_exc()}
+json.dumps(_res)
+`) as string;
+  return JSON.parse(resultJson) as PyodideToolCallResult;
 }
