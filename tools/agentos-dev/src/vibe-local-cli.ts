@@ -8,6 +8,7 @@ import { createClient } from "rivetkit/client";
 
 import { AGENTOS_PORT } from "./config.js";
 import { registry } from "./registry.js";
+import { pyodideChat } from "./pyodide-runtime.js";
 import {
   FixedFooter,
   bold,
@@ -256,6 +257,7 @@ async function watchExistingSession(
 function usage() {
   console.log(`Usage:
   pnpm vibe-local:cli health
+  pnpm vibe-local:cli pyodide-chat <prompt...>
   pnpm vibe-local:cli projects
   pnpm vibe-local:cli project-info <project>
   pnpm vibe-local:cli git-status
@@ -696,6 +698,42 @@ async function main() {
   switch (command) {
     case "health": {
       console.log(JSON.stringify(await actor.health(), null, 2));
+      return;
+    }
+    case "pyodide-chat": {
+      // One-shot: route through vibe-coder.py running in Pyodide (WASM).
+      // This proves the "vibe-local-wasm" core is actually working.
+      const prompt = args.join(" ").trim();
+      if (!prompt) {
+        throw new Error("Usage: pyodide-chat <prompt...>");
+      }
+      const settings = loadBackendSettings();
+      const baseUrl = settings.baseUrl.replace(/\/v1\/?$/, "");
+      console.log(dim(`[pyodide] loading runtime + vibe-coder.py…`));
+      const t0 = Date.now();
+      const result = await pyodideChat({
+        baseUrl,
+        model: settings.model,
+        messages: [{ role: "user", content: prompt }],
+        maxTokens: settings.maxTokens,
+        temperature: settings.temperature,
+      });
+      const elapsedMs = Date.now() - t0;
+      if (!result.ok) {
+        console.log(errorColor(`[pyodide] error: ${result.error}`));
+        process.exitCode = 1;
+        return;
+      }
+      console.log(bold("Response:"));
+      console.log(result.content);
+      const usage = result.usage;
+      if (usage) {
+        console.log(
+          dim(
+            `\n[pyodide] ${elapsedMs}ms ${usage.prompt_tokens}→${usage.completion_tokens} tokens`,
+          ),
+        );
+      }
       return;
     }
     case "projects": {

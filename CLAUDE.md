@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **agentOS**: Rivet-based managed VM runtime for workspace virtualization and tool execution
 - **AgentFS**: Filesystem mirroring/audit layer backed by SQLite
 - **sandbox-agent**: Separate execution plane for coding agents
-- **Pyodide (WASM)**: vibe-coder.py のコアロジックを WASM 上で実行する（目標）
+- **Pyodide (WASM)**: 本家 `vibe-coder.py` (~8200行) をそのまま WASM 上で実行（`pyodide-chat` コマンドで利用可能）
 - **sql.js (WASM)**: In-browser SQLite for session persistence
 
 ## 本家 vibe-local との関係
@@ -29,6 +29,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - バックエンドが agentOS + sandbox-agent（本家は Ollama 直接通信）
 - セッション永続化が actor-local SQLite（本家は JSONL）
 - Web UI あり（本家は TUI only）
+
+## Pyodide ランタイム（実装済み）
+
+`pyodide-chat` サブコマンドは、本家 `vibe-coder.py` を Pyodide (WASM) にロードして実際に実行する。
+
+```
+CLI (pyodide-chat) → pyodide-runtime.ts → Pyodide → vibe-coder.py
+                                                    ├── OllamaClient.chat()
+                                                    └── urllib.request (bridged)
+                                                         ↓
+                                                    JS curl execSync → LLM
+```
+
+主要ファイル:
+- `tools/agentos-dev/src/pyodide-runtime.ts` — Pyodide 初期化、urllib/subprocess bridge、`pyodideChat()` API
+- `tools/agentos-dev/src/pyodide-core/vibe-coder.py` — 本家 ochyai/vibe-local のコード（8221行、そのまま）
+
+Pyodideで動かすために必要だったパッチ:
+- `urllib.request.urlopen` → JS bridge（curl execSync 経由の同期HTTP）
+- `subprocess.run`/`check_output` → JS bridge（Node child_process execFileSync 経由）
+- `OllamaClient._native_to_openai_response` → llama.cpp/vLLM の OpenAI-format レスポンスも pass-through
+
+初回ロードは ~1.5 秒（Pyodide 起動 + sqlite3 package + vibe-coder.py パース）、以後は プロセス内キャッシュ。
 
 ## Monorepo Structure
 
