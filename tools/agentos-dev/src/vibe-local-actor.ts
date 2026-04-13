@@ -19,6 +19,7 @@ import {
   resolveProject,
   runProjectScript,
 } from "./projects.js";
+import { pyodideRunAgentTurn } from "./pyodide-runtime.js";
 import { runGit, searchCode } from "./shared/git-utils.js";
 import { webFetch } from "./tools/web-fetch.js";
 import { webSearch } from "./tools/web-search.js";
@@ -2671,6 +2672,163 @@ async function finalizeAgentTurn(
   };
 }
 
+async function executePyodideAgentTurn(
+  dbClient: RawAccess,
+  snapshot: SessionSnapshot,
+  prompt: string,
+  settings: BackendSettings,
+  selectedProject: string,
+  executionMode: ToolExecutionMode,
+  continueCount: number,
+): Promise<AgentTurnResult> {
+  const runId = crypto.randomUUID();
+  const createdAt = snapshot.task?.createdAt ?? nowIso();
+
+  await saveTaskState(dbClient, {
+    sessionId: snapshot.session.id,
+    goal: prompt,
+    selectedProject,
+    status: "running",
+    lastResponse: "",
+    lastError: "",
+    continueCount,
+    settings,
+    createdAt,
+    updatedAt: nowIso(),
+  });
+  await persistArtifact(dbClient, snapshot.session.id, "agent_run_started", {
+    executionMode,
+    prompt,
+    runId,
+    selectedProject,
+  });
+
+  // Build messages: system prompt + session history + new user message
+  const historyMessages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
+    {
+      role: "system",
+      content: createAgentSystemPrompt(selectedProject, settings.systemPrompt, executionMode),
+    },
+    ...snapshot.messages.map((m) => ({
+      role: m.role as "system" | "user" | "assistant",
+      content: m.content,
+    })),
+    { role: "user", content: prompt },
+  ];
+
+  // vibe-coder.py's OllamaClient appends /api/chat to base_url, so strip any trailing /v1
+  const baseUrl = settings.baseUrl.trim().replace(/\/v1\/?$/, "");
+
+  try {
+    const result = await pyodideRunAgentTurn({
+      baseUrl,
+      model: settings.model,
+      messages: historyMessages,
+      maxTokens: settings.maxTokens,
+      temperature: settings.temperature,
+      maxIterations: 8,
+    });
+
+    if (!result.ok) {
+      throw new Error(result.error ?? "Pyodide agent turn failed");
+    }
+
+    // Persist each tool event as an agent_tool_event artifact
+    const toolCalls: ToolExecutionTrace[] = [];
+    for (const event of result.toolEvents) {
+      const startedAt = nowIso();
+      const trace: ToolExecutionTrace = {
+        name: event.name,
+        input: event.args,
+        outputPreview: event.output.slice(0, 500),
+        startedAt,
+        finishedAt: startedAt,
+        status: "completed",
+      };
+      toolCalls.push(trace);
+      await persistAgentToolEvent(dbClient, snapshot.session.id, {
+        eventId: crypto.randomUUID(),
+        executionMode,
+        finishedAt: startedAt,
+        input: event.args,
+        name: event.name,
+        outputPreview: event.output.slice(0, 500),
+        phase: "finished",
+        prompt,
+        runId,
+        selectedProject,
+        startedAt,
+        status: "completed",
+      });
+    }
+
+    // Persist the final assistant message
+    const persistedAssistant = await persistMessage(
+      dbClient,
+      snapshot.session.id,
+      "assistant",
+      result.content,
+    );
+
+    // Persist the agent_run summary artifact
+    const artifact = await persistArtifact(dbClient, snapshot.session.id, "agent_run", {
+      executionMode,
+      finalResponse: result.content,
+      pendingApprovals: [],
+      prompt,
+      runId,
+      selectedProject,
+      toolCalls,
+    } satisfies AgentRunArtifactPayload);
+
+    // Save final task state
+    const task = await saveTaskState(dbClient, {
+      sessionId: snapshot.session.id,
+      goal: prompt,
+      selectedProject,
+      status: "completed",
+      lastResponse: result.content,
+      lastError: "",
+      continueCount,
+      settings,
+      createdAt,
+      updatedAt: nowIso(),
+    });
+
+    return {
+      approvals: [],
+      artifact,
+      message: persistedAssistant.message,
+      pendingApproval: false,
+      session: persistedAssistant.session,
+      task,
+      toolCalls,
+    };
+  } catch (error) {
+    const message = toErrorMessage(error);
+    await saveTaskState(dbClient, {
+      sessionId: snapshot.session.id,
+      goal: prompt,
+      selectedProject,
+      status: "failed",
+      lastResponse: "",
+      lastError: message,
+      continueCount,
+      settings,
+      createdAt,
+      updatedAt: nowIso(),
+    });
+    await persistArtifact(dbClient, snapshot.session.id, "agent_run_failed", {
+      error: message,
+      executionMode,
+      prompt,
+      runId,
+      selectedProject,
+    });
+    throw error;
+  }
+}
+
 async function executeAgentTurnWithProgress(
   dbClient: RawAccess,
   snapshot: SessionSnapshot,
@@ -3061,7 +3219,19 @@ export const vibeLocalActor = actor({
       const existing = await requireSnapshot(c.db, sessionId);
       const persistedUser = await persistMessage(c.db, sessionId, "user", prompt);
       const executionMode = sessionModeToExecutionMode(existing.session.mode);
+      const usePyodide = process.env.VIBE_LOCAL_PYODIDE === "1";
       try {
+        if (usePyodide) {
+          return await executePyodideAgentTurn(
+            c.db,
+            existing,
+            persistedUser.message.content,
+            settings,
+            selectedProject,
+            executionMode,
+            0,
+          );
+        }
         return await executeAgentTurnWithProgress(
           c.db,
           existing,
