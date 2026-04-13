@@ -20,6 +20,14 @@ import {
   runProjectScript,
 } from "./projects.js";
 import { runGit, searchCode } from "./shared/git-utils.js";
+import { webFetch } from "./tools/web-fetch.js";
+import { webSearch } from "./tools/web-search.js";
+import { runBash } from "./tools/bash.js";
+import { runGlob } from "./tools/glob.js";
+import { runGrep } from "./tools/grep.js";
+import { editNotebook } from "./tools/notebook-edit.js";
+import { defaultTaskStore } from "./tools/task-manager.js";
+import { defaultQuestionBus } from "./tools/ask-user.js";
 
 type SessionMode = "plan" | "act" | "yolo";
 type ChatRole = "assistant" | "system" | "user";
@@ -413,6 +421,210 @@ const CODING_TOOL_SCHEMAS = [
           subAgentId: { type: "string" },
         },
         required: ["subAgentId"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "webFetch",
+      description: "Fetch a URL and return plain-text content (HTML stripped). Use for reading web pages, API responses, or documentation.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          url: { type: "string", description: "HTTP/HTTPS URL to fetch" },
+          max_bytes: { type: "number", description: "Max bytes to read (default 1000000)" },
+        },
+        required: ["url"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "webSearch",
+      description: "Search the web via DuckDuckGo. Returns title, URL, and snippet for each result.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          query: { type: "string", description: "Search query" },
+          max_results: { type: "number", description: "Max results (default 10)" },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "bash",
+      description: "Run an arbitrary shell command. Supports pipes, redirects, etc. Use with care — requires approval unless in YOLO mode.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          command: { type: "string", description: "Shell command to execute" },
+          cwd: { type: "string", description: "Working directory (default: repo root)" },
+          timeout_ms: { type: "number", description: "Timeout in ms (default 60000)" },
+        },
+        required: ["command"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "glob",
+      description: "Find files matching a glob pattern (e.g. **/*.ts). Results sorted by modification time.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          pattern: { type: "string", description: "Glob pattern like **/*.ts or src/**/*.test.tsx" },
+          path: { type: "string", description: "Base directory (default: repo root)" },
+          max_results: { type: "number", description: "Max results (default 200)" },
+        },
+        required: ["pattern"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "grep",
+      description: "Search file contents with ripgrep. Supports files_with_matches, content, and count modes.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          pattern: { type: "string", description: "Regex pattern" },
+          path: { type: "string", description: "Search path (default: repo root)" },
+          glob: { type: "string", description: "File filter like *.ts" },
+          case_insensitive: { type: "boolean" },
+          output_mode: {
+            type: "string",
+            enum: ["content", "files_with_matches", "count"],
+            description: "Output mode (default files_with_matches)",
+          },
+          context: { type: "number", description: "Lines of context around matches (content mode only)" },
+          max_results: { type: "number" },
+        },
+        required: ["pattern"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "notebookEdit",
+      description: "Edit a Jupyter notebook (.ipynb) cell: replace, insert, or delete.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          path: { type: "string", description: "Notebook path (repo-relative)" },
+          cell_index: { type: "number", description: "Cell index (0-based)" },
+          new_source: { type: "string", description: "New cell source (for replace/insert)" },
+          cell_type: { type: "string", enum: ["code", "markdown"] },
+          edit_mode: {
+            type: "string",
+            enum: ["replace", "insert", "delete"],
+            description: "Edit mode (default replace)",
+          },
+        },
+        required: ["path", "cell_index", "new_source"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "taskCreate",
+      description: "Create a new task in the agent's task list.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          subject: { type: "string", description: "Short task title" },
+          description: { type: "string", description: "Task description" },
+        },
+        required: ["subject"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "taskList",
+      description: "List tasks, optionally filtered by status.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          status: {
+            type: "string",
+            enum: ["pending", "in_progress", "completed", "cancelled"],
+          },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "taskGet",
+      description: "Get a task by id.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          id: { type: "string" },
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "taskUpdate",
+      description: "Update a task's status, subject, or description.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          id: { type: "string" },
+          status: {
+            type: "string",
+            enum: ["pending", "in_progress", "completed", "cancelled"],
+          },
+          subject: { type: "string" },
+          description: { type: "string" },
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "askUserQuestion",
+      description: "Ask the user a question and wait for their response. Use when you need clarification.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          question: { type: "string" },
+          options: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional multiple-choice options",
+          },
+        },
+        required: ["question"],
       },
     },
   },
@@ -1193,6 +1405,98 @@ async function executeCodingTool(name: string, args: Record<string, unknown>) {
         String(args.script ?? ""),
         Number(args.timeoutMs ?? 120_000),
       );
+    case "webFetch": {
+      return await webFetch({
+        url: String(args.url ?? ""),
+        max_bytes: args.max_bytes !== undefined ? Number(args.max_bytes) : 1_000_000,
+      });
+    }
+    case "webSearch": {
+      return await webSearch({
+        query: String(args.query ?? ""),
+        max_results: args.max_results !== undefined ? Number(args.max_results) : 10,
+        region: String(args.region ?? "jp-ja"),
+      });
+    }
+    case "bash": {
+      return await runBash(
+        {
+          command: String(args.command ?? ""),
+          cwd: args.cwd !== undefined ? String(args.cwd) : undefined,
+          timeout_ms: args.timeout_ms !== undefined ? Number(args.timeout_ms) : 60_000,
+          max_bytes: args.max_bytes !== undefined ? Number(args.max_bytes) : 2_000_000,
+        },
+        REPO_ROOT,
+      );
+    }
+    case "glob": {
+      return await runGlob(
+        {
+          pattern: String(args.pattern ?? ""),
+          path: args.path !== undefined ? String(args.path) : undefined,
+          max_results: args.max_results !== undefined ? Number(args.max_results) : 200,
+        },
+        REPO_ROOT,
+      );
+    }
+    case "grep": {
+      const mode = (args.output_mode as "content" | "files_with_matches" | "count" | undefined) ?? "files_with_matches";
+      return await runGrep(
+        {
+          pattern: String(args.pattern ?? ""),
+          path: args.path !== undefined ? String(args.path) : undefined,
+          glob: args.glob !== undefined ? String(args.glob) : undefined,
+          case_insensitive: Boolean(args.case_insensitive ?? false),
+          multiline: Boolean(args.multiline ?? false),
+          output_mode: mode,
+          context: args.context !== undefined ? Number(args.context) : 0,
+          max_results: args.max_results !== undefined ? Number(args.max_results) : 100,
+        },
+        REPO_ROOT,
+      );
+    }
+    case "notebookEdit": {
+      const mode = (args.edit_mode as "replace" | "insert" | "delete" | undefined) ?? "replace";
+      return await editNotebook(
+        {
+          path: String(args.path ?? ""),
+          cell_index: Number(args.cell_index ?? 0),
+          new_source: String(args.new_source ?? ""),
+          cell_type: args.cell_type as "code" | "markdown" | undefined,
+          edit_mode: mode,
+        },
+        REPO_ROOT,
+      );
+    }
+    case "taskCreate": {
+      return defaultTaskStore.create({
+        subject: String(args.subject ?? ""),
+        description: String(args.description ?? ""),
+      });
+    }
+    case "taskList": {
+      const status = args.status as "pending" | "in_progress" | "completed" | "cancelled" | undefined;
+      return defaultTaskStore.list({ status });
+    }
+    case "taskGet": {
+      return defaultTaskStore.get({ id: String(args.id ?? "") });
+    }
+    case "taskUpdate": {
+      const status = args.status as "pending" | "in_progress" | "completed" | "cancelled" | undefined;
+      return defaultTaskStore.update({
+        id: String(args.id ?? ""),
+        status,
+        subject: args.subject !== undefined ? String(args.subject) : undefined,
+        description: args.description !== undefined ? String(args.description) : undefined,
+      });
+    }
+    case "askUserQuestion": {
+      const options = Array.isArray(args.options) ? args.options.map(String) : undefined;
+      return await defaultQuestionBus.ask({
+        question: String(args.question ?? ""),
+        options,
+      });
+    }
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
