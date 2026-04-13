@@ -913,7 +913,7 @@ async function callOpenAiCompatible(
   const controller = new AbortController();
   const timeout = setTimeout(() => {
     controller.abort("Agent request timed out.");
-  }, 45_000);
+  }, 180_000);
   let response: Response;
   try {
     response = await fetch(`${settings.baseUrl.trim().replace(/\/$/, "")}/chat/completions`, {
@@ -939,7 +939,7 @@ async function callOpenAiCompatible(
     });
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
-      throw new Error("Agent request timed out after 45s.");
+      throw new Error("Agent request timed out after 180s.");
     }
     throw error;
   } finally {
@@ -948,8 +948,12 @@ async function callOpenAiCompatible(
 
   if (!response.ok) {
     const errorBody = await response.text();
-    // Retry without tools if the model doesn't support function calling
-    if (includeTools && errorBody.includes("does not support tools")) {
+    // Retry without tools if model doesn't support them or context window is too small
+    if (
+      includeTools &&
+      (errorBody.includes("does not support tools") ||
+        errorBody.includes("maximum context length"))
+    ) {
       return callOpenAiCompatible(settings, messages, false, toolSchemas);
     }
     throw new Error(`Agent request failed: ${errorBody}`);
@@ -982,7 +986,7 @@ async function streamOpenAiCompatibleText(
     }
     idleTimer = setTimeout(() => {
       controller.abort("Agent stream became idle.");
-    }, 2_500);
+    }, 30_000);
   };
 
   const normalizedMessages = normalizeOpenAiMessages(messages);
