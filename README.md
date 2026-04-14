@@ -3,7 +3,7 @@
 [ochyai/vibe-local](https://github.com/ochyai/vibe-local)（落合陽一氏による Free AI Coding Agent）の WASM 版です。
 
 本家 `vibe-local` は Python stdlib only の単一ファイル (`vibe-coder.py`) で Ollama と直接通信するコーディングエージェントです。  
-本リポジトリはそのコア機能を `agentOS + SQLite + sandbox-agent + AgentFS` の上に再実装し、バックエンドを WASM (Pyodide) 上でも動かせるようにすることを目指しています。
+本リポジトリはそのコア機能を `agentOS + SQLite + sandbox-agent + AgentFS` の上に再実装し、バックエンドを WASM (Pyodide) 上でも動かせるようにすることを目指しています。現時点で主に整備されているのは **CLI/TUI path** です。
 
 CLI/TUI の体験は本家 vibe-local に準拠します。本家にないコマンドや API は原則として実装しません。
 
@@ -24,6 +24,7 @@ CLI/TUI の体験は本家 vibe-local に準拠します。本家にないコマ
   - vendored `vibe-coder.py` を Pyodide で実行
   - agentOS manager
   - actor-local SQLite persistence
+  - JS bridge for `WebSearch` / `NotebookEdit` / `Task*` / `AskUserQuestion`
 
 後回しのままのもの:
 
@@ -33,9 +34,6 @@ CLI/TUI の体験は本家 vibe-local に準拠します。本家にないコマ
 
 ## Repository layout
 
-- `vibe-local-pyodide/`
-  - React + Vite の Web クライアント
-  - Pyodide ベースの local fallback も含む
 - `tools/agentos-dev/`
   - `agentOS` registry
   - actor runtime
@@ -44,11 +42,12 @@ CLI/TUI の体験は本家 vibe-local に準拠します。本家にないコマ
   - AgentFS integration
 - `bin/vibe-local-wasm.mjs`
   - standalone command entrypoint
+- `vibe-local-pyodide/`
+  - 以前の Web UI 実験実装
+  - 現在の root workspace / root scripts の主経路には含めていない
 
-## Default ports
+## Active ports
 
-- Web UI: `5374`
-- Web preview: `4374`
 - agentOS manager: `6520`
 - sandbox-agent provider: `2568`
 
@@ -56,19 +55,12 @@ CLI/TUI の体験は本家 vibe-local に準拠します。本家にないコマ
 
 - `AGENTOS_PORT`
 - `SANDBOX_AGENT_PORT`
-- `VIBE_LOCAL_PORT`
 - `SANDBOX_AGENT_LOG`
 
 ## Quick start
 
 ```bash
 pnpm install
-pnpm run dev
-```
-
-別ターミナルで CLI を使います。
-
-```bash
 pnpm run cli -- chat vibe-local-pyodide --mode act
 ```
 
@@ -85,7 +77,6 @@ pnpm link --global
 例:
 
 ```bash
-vibe-local-wasm dev
 vibe-local-wasm agentos
 vibe-local-wasm chat vibe-local-pyodide --mode act
 vibe-local-wasm chat --list-sessions
@@ -95,7 +86,6 @@ vibe-local-wasm --version
 ## Root scripts
 
 ```bash
-pnpm run dev
 pnpm run agentos
 pnpm run start:agentos
 pnpm run check
@@ -143,27 +133,6 @@ interactive chat では次が使えます。
 - `/init`
 - `/exit`
 
-## Web UI behavior
-
-Web UI は chat-first です。
-
-- メイン画面は transcript と tool log が中心
-- settings panel は開閉でき、状態は localStorage に保存
-- backend settings は localStorage に保存
-- 会話本体と session 状態は actor-local SQLite に保存
-- selected session は必要時に詳細 hydrate される
-- running task / running sub-agent があると自動追従で再取得する
-
-Web から見える主要な操作:
-
-- session 作成
-- mode 切り替え
-- approval
-- compact
-- export
-- backend settings 保存
-- model 一覧取得
-
 ## Model/backend settings
 
 CLI の既定設定は `~/.config/opencode/config.json` から読みます。
@@ -171,7 +140,7 @@ CLI の既定設定は `~/.config/opencode/config.json` から読みます。
 現状の前提:
 
 - OpenAI-compatible `/chat/completions` backend を使う
-- model 一覧取得が使える backend だと UI の model refresh が有効
+- model 一覧取得が使える backend だと `/models` が有効
 
 ## Persistence
 
@@ -190,6 +159,10 @@ CLI の既定設定は `~/.config/opencode/config.json` から読みます。
   - sandbox-agent を使う coding execution plane
 - `vibeLocal` actor
   - sessions / messages / approvals / artifacts / sub-agents / task state を保持する
+
+## Archived web surface
+
+`vibe-local-pyodide/` には React + Vite ベースの Web UI 実装が残っていますが、現行の root workspace / root scripts / 検証導線は CLI-first です。Web 側は参照用・将来の整理対象として repo に残してあり、現フェーズではアクティブな提供面として扱っていません。
 
 ## Verification status
 

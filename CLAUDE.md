@@ -12,7 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **AgentFS**: Filesystem mirroring/audit layer backed by SQLite
 - **sandbox-agent**: Separate execution plane for coding agents
 - **Pyodide (WASM)**: 本家 `vibe-coder.py` (~8200行) をそのまま WASM 上で実行（CLI `chat` の既定実行経路）
-- **sql.js (WASM)**: In-browser SQLite for session persistence
+- **sql.js (WASM)**: 旧 Web UI 側に残る browser persistence layer（現行の主経路ではない）
 
 ## 本家 vibe-local との関係
 
@@ -28,7 +28,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 本リポジトリの差分:
 - バックエンドが agentOS + sandbox-agent（本家は Ollama 直接通信）
 - セッション永続化が actor-local SQLite（本家は JSONL）
-- Web UI あり（本家は TUI only）
+- 旧 Web UI 実装が repo には残るが、現行の主経路は CLI/TUI
 
 ## Pyodide ランタイム（実装済み）
 
@@ -85,7 +85,7 @@ CLI → actor.runAgentTurn(prompt)
 
 ### ブリッジ経由のツール (`_js_tool_dispatch`)
 
-`Bash` / `Read` / `Write` / `Edit` / `Glob` / `Grep` / `WebFetch` は JS 側で同期的に実行。vibe-coder.py の Python 実装は呼び出されない（Tool クラスのインスタンスは存在するが、execute だけ差し替え）。
+`Bash` / `Read` / `Write` / `Edit` / `Glob` / `Grep` / `WebFetch` / `WebSearch` / `NotebookEdit` / `TaskCreate` / `TaskList` / `TaskGet` / `TaskUpdate` / `AskUserQuestion` は JS 側で処理される。`SubAgent` / `ParallelAgents` は未 bridge のまま。
 
 ### パフォーマンス
 
@@ -134,30 +134,21 @@ vibe-local-wasm cli <command>    # after pnpm link --global
 pnpm run cli -- chat vibe-local-pyodide --mode act
 ```
 
-## Architecture (3-Layer)
+## Architecture (CLI-first)
 
 ```
-Browser/CLI → Vite Middleware (/__vibe_local/*) → RivetKit Client → agentOS Manager (:6520)
-                                                                        ├── vibeLocal actor (sessions/messages/approvals/artifacts)
-                                                                        ├── workspaceVm (Pi + host toolkits)
-                                                                        └── codingSandbox (sandbox-agent :2568)
+CLI → vibeLocal actor → Pyodide runtime → agentOS Manager surfaces
+                                 ├── workspaceVm (Pi + host toolkits)
+                                 └── codingSandbox (sandbox-agent :2568)
 ```
 
-- **vibeLocal actor**: Actor key `["browser-core"]`. Persists sessions, messages, approvals, artifacts, sub-agents, task state to SQLite.
+- **vibeLocal actor**: Actor key `["browser-core"]` のまま使っているが、現在の主利用者は CLI。sessions / messages / approvals / artifacts / sub-agents / task state を SQLite に保存する。
 - **workspaceVm**: Mounts repo read-only at `/mnt/repo`, writable workspace at `/mnt/workspace`. Provides host toolkits (repo inspection, git, code search, script execution).
 - **codingSandbox**: Runs coding agents via `sandbox-agent` local provider.
 
-## Vite Middleware Routes
+## Archived web integration
 
-All browser-to-backend communication goes through Vite middleware defined in `vibe-local-pyodide/vite.config.ts`. Key route prefixes:
-
-- `/__vibe_local/agentos/*` → actor session management (create, config, message, compact, run-agent, export, hydrate, health)
-- `/__vibe_local/coding/*` → file ops, git, search, project listing, script execution
-- `/__vibe_local/chat` → OpenAI-compatible streaming proxy
-- `/__vibe_local/models` → model list proxy
-- `/__vibe_local/opencode-config` → reads `~/.config/opencode/config.json`
-
-The middleware calls `vibeLocal` actor via `rivetkit` client at `AGENTOS_ENDPOINT` (default `http://127.0.0.1:6420`).
+`vibe-local-pyodide/vite.config.ts` には旧 Web UI 用の Vite middleware が残っている。`/__vibe_local/*` ルート群や browser persistence はこの実装に属するが、現行の root workspace / root scripts / 検証導線では主経路として扱っていない。
 
 ## Persistence
 
@@ -166,8 +157,7 @@ The middleware calls `vibeLocal` actor via `rivetkit` client at `AGENTOS_ENDPOIN
 | Actor state (sessions, messages) | SQLite via RivetKit | `tools/agentos-dev/.agentos-dev/rivetkit/` |
 | Workspace files | Host filesystem | `tools/agentos-dev/.agentos-dev/workspace/` |
 | AgentFS mirror/audit | SQLite | `tools/agentos-dev/.agentos-dev/agentfs/workspace.db` |
-| Backend settings (Web) | localStorage | Browser |
-| Browser SQLite (fallback) | IndexedDB via sql.js | Browser (`vibe-local-pyodide.sqlite`) |
+| Browser fallback state (archived web) | localStorage / IndexedDB via sql.js | `vibe-local-pyodide/` side only |
 
 ## Environment Variables
 
@@ -177,7 +167,6 @@ The middleware calls `vibeLocal` actor via `rivetkit` client at `AGENTOS_ENDPOIN
 | `AGENTOS_ENDPOINT` | `http://127.0.0.1:6420` | RivetKit client endpoint (used in vite.config.ts) |
 | `SANDBOX_AGENT_PORT` | `2568` | sandbox-agent provider port |
 | `SANDBOX_AGENT_LOG` | — | `inherit` / `pipe` / `silent` |
-| `VIBE_LOCAL_PORT` | `5374` | Web UI port |
 | `OPENAI_API_KEY` | — | Forwarded to sandbox-agent |
 | `ANTHROPIC_API_KEY` | — | Forwarded to sandbox-agent |
 | `AGENTOS_DEBUG` | — | Enable debug logging |
@@ -193,25 +182,21 @@ The middleware calls `vibeLocal` actor via `rivetkit` client at `AGENTOS_ENDPOIN
 | `tools/agentos-dev/src/toolkits.ts` | Host toolkits (repo, git, code search) |
 | `tools/agentos-dev/src/projects.ts` | Project discovery via package.json walking |
 | `tools/agentos-dev/src/server.ts` | RivetKit manager startup |
-| `vibe-local-pyodide/src/App.tsx` | Main React component (chat UI, settings, session management) |
-| `vibe-local-pyodide/vite.config.ts` | Vite middleware (all `/__vibe_local/*` routes) |
-| `vibe-local-pyodide/src/persistence/sqliteStore.ts` | sql.js browser-side SQLite |
-| `vibe-local-pyodide/src/persistence/agentosStore.ts` | agentOS actor integration for frontend |
-| `vibe-local-pyodide/src/lib/codingTools.ts` | HTTP client for agentOS coding endpoints |
+| `vibe-local-pyodide/` | Archived web UI implementation retained in the repo but outside the active root workspace |
 
 ## Design Decisions
 
 - **本家準拠**: CLI/TUI のコマンド体系は ochyai/vibe-local に準拠。本家にない独自コマンドは追加しない。
-- **Actor-local SQLite for conversations, localStorage for settings**: Settings stay in browser, conversation state lives in the actor.
+- **Actor-local SQLite for conversations**: 現行の CLI path では会話本体も設定読み出しも host/actor 側を主に使う。
 - **AgentFS is a mirror/audit layer**: Host filesystem is always the source of truth; AgentFS provides parallel tracking.
 - **Execution modes**: Plan / Act（本家準拠）。YOLO は本家の `--yes` フラグに相当。
-- **本家で実装済みだがこちらで未実装**: file watcher, auto-test loop, Git checkpoint/rollback, MCP連携, スキルシステム, /undo, /tokens, /config, /commit, /diff, /git
+- **本家で実装済みだがこちらで未実装**: file watcher, auto-test loop, MCP連携, `/undo`, `SubAgent`, `ParallelAgents`
 
 ## Technology Stack
 
 - **Runtime**: Node.js (ESM), TypeScript, tsx
 - **Package manager**: pnpm 10.18.3 (workspaces)
-- **Frontend**: React 19, Vite 7, sql.js, react-markdown, lucide-react
+- **Frontend (archived web only)**: React 19, Vite 7, sql.js, react-markdown, lucide-react
 - **Backend**: RivetKit 2.2.1, rivet agent-os packages, sandbox-agent 0.4.2, agentfs-sdk, Zod 4
 - **Testing**: Playwright (E2E), smoke/doctor scripts
 - **WASM**: sql.js provides in-browser SQLite via WASM (no custom WASM compilation needed)

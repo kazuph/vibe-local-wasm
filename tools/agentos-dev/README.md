@@ -1,12 +1,12 @@
 # agentOS Hybrid Dev Runtime
 
-このディレクトリは `vibe-local-wasm` 用の開発オーケストレーション層です。`pnpm-workspace` の一部としてぶら下がり、browser UI と actor runtime をまとめて起動します。
+このディレクトリは `vibe-local-wasm` 用の開発オーケストレーション層です。現行の主経路は CLI/TUI で、ここが actor runtime / registry / CLI をまとめて提供します。
 
 ## 何をしているか
 
 - `workspaceVm`: `agentOS` 上で Pi と host toolkits を動かす高速な VM
 - `codingSandbox`: `sandbox-agent` を `local` provider 経由で起動する coding agent 実行面
-- `vibeLocal`: `vibe-local-pyodide` の session / transcript を actor-local SQLite に保存する browser-core actor
+- `vibeLocal`: CLI と旧 Web UI の session / transcript を actor-local SQLite に保存する actor
 - repo 全体を `agentOS` に read-only mount し、host 側で project discovery と script 実行を補助
 
 ## 重要な前提
@@ -20,10 +20,10 @@
 
 ```bash
 pnpm run doctor
-pnpm run dev
+pnpm run agentos
 ```
 
-project を開く:
+project を開く（debug / inspection 用）:
 
 ```bash
 pnpm agentos:open -- --project vibe-local-pyodide
@@ -31,10 +31,10 @@ pnpm agentos:open -- --project vibe-local-pyodide --surface workspace
 pnpm agentos:open -- --project vibe-local-pyodide --surface sandbox --agent codex
 ```
 
-`vibe-local-pyodide` を対象 project として CLI から使う:
+CLI からは project selector を渡して使う:
 
 ```bash
-pnpm run dev
+pnpm run agentos
 pnpm run cli -- chat vibe-local-pyodide --mode act
 pnpm run cli -- chat vibe-local-pyodide --mode plan
 ```
@@ -75,6 +75,6 @@ CLI からは同じ `vibeLocal` actor を直接叩き、会話・compact artifac
 
 - actor key は `["browser-core"]`
 - 保存テーブルは `sessions`, `messages`, `artifacts`
-- `GET /__vibe_local/agentos/*` と `POST /__vibe_local/agentos/*` は `vibe-local-pyodide` の Vite middleware から actor を叩きます
-- backend settings は引き続き browser の localStorage に保存し、会話本体だけを actor-local SQLite に寄せています
+- 旧 Web UI を使う場合は `vibe-local-pyodide` 側の Vite middleware からも同じ actor を叩けますが、現行の主経路は CLI です
+- browser 側の localStorage / sql.js は archived web surface の話で、CLI path では actor-local SQLite が主経路です
 - `tools/agentos-dev/.agentos-dev/workspace` は引き続き host filesystem を正とし、AgentFS はその mirror / audit layer として並行保存します

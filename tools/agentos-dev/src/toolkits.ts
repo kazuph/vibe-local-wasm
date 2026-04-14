@@ -36,8 +36,8 @@ export const repoToolkit = toolKit({
       },
       examples: [
         {
-          description: "Inspect the bundled web client",
-          input: { project: "vibe-local-pyodide" },
+          description: "Inspect the active CLI/runtime package",
+          input: { project: "@vibe-local-wasm/agentos" },
         },
       ],
     }),
@@ -53,8 +53,8 @@ export const repoToolkit = toolKit({
       },
       examples: [
         {
-          description: "Run the web client checks",
-          input: { project: "vibe-local-pyodide", script: "check", timeoutMs: 120000 },
+          description: "Run the CLI/runtime checks",
+          input: { project: "@vibe-local-wasm/agentos", script: "check", timeoutMs: 120000 },
         },
       ],
     }),
