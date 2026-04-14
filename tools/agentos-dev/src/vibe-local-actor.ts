@@ -80,6 +80,7 @@ type SubAgentRun = {
 type BackendSettings = {
   apiKey: string;
   baseUrl: string;
+  contextWindow: number;
   maxTokens: number;
   model: string;
   systemPrompt: string;

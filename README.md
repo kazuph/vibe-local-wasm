@@ -85,6 +85,8 @@ pnpm link --global
 vibe-local-wasm dev
 vibe-local-wasm agentos
 vibe-local-wasm chat vibe-local-pyodide --mode act
+vibe-local-wasm chat --list-sessions
+vibe-local-wasm --version
 ```
 
 ## Root scripts
@@ -106,6 +108,11 @@ pnpm run smoke
 ```bash
 vibe-local-wasm cli chat vibe-local-pyodide --mode act
 pnpm run cli -- chat vibe-local-pyodide --mode plan
+pnpm run cli -- chat vibe-local-pyodide --prompt "Reply with exactly OK."
+pnpm run cli -- chat --resume --debug
+pnpm run cli -- chat --session-id 51d137c1 --debug
+pnpm run cli -- chat --list-sessions
+pnpm run cli -- --version
 ```
 
 interactive chat では次が使えます。
