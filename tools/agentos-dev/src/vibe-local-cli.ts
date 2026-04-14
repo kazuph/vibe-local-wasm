@@ -514,6 +514,50 @@ function isDangerousGitArg(arg: string) {
   return exact.has(normalized) || prefixes.some((prefix) => normalized.startsWith(prefix));
 }
 
+function isCliPathInside(root: string, candidate: string) {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function validateCliAccessiblePath(raw: string, cwd = REPO_ROOT) {
+  if (!raw || /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw) || raw === "-") {
+    return;
+  }
+  if (
+    path.isAbsolute(raw) ||
+    raw === "." ||
+    raw === ".." ||
+    raw.startsWith("./") ||
+    raw.startsWith("../") ||
+    raw.includes("/")
+  ) {
+    const resolved = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(cwd, raw);
+    if (!isCliPathInside(REPO_ROOT, resolved) && !isCliPathInside("/tmp", resolved)) {
+      throw new Error(`Path outside execution root is not allowed: ${raw}`);
+    }
+  }
+}
+
+function validateCliGitArgs(args: string[]) {
+  let expectPath = false;
+  for (const arg of args) {
+    if (expectPath) {
+      validateCliAccessiblePath(arg);
+      expectPath = false;
+      continue;
+    }
+    if (arg === "-C" || arg === "--git-dir" || arg === "--work-tree") {
+      expectPath = true;
+      continue;
+    }
+    if (arg.startsWith("--git-dir=") || arg.startsWith("--work-tree=")) {
+      validateCliAccessiblePath(arg.split("=", 2)[1] ?? "");
+      continue;
+    }
+    validateCliAccessiblePath(arg);
+  }
+}
+
 function listSkillFiles(baseDir: string) {
   if (!existsSync(baseDir)) {
     return [] as Array<{ lines: number; name: string; path: string }>;
@@ -1021,6 +1065,7 @@ async function runInteractiveChat(
             console.log(errorColor("Blocked: /git does not allow -c, --config, or exec-path options."));
             continue;
           }
+          validateCliGitArgs(gitArgs);
           const result = await runGit(gitArgs);
           if (result.stdout) {
             process.stdout.write(result.stdout.endsWith("\n") ? result.stdout : `${result.stdout}\n`);

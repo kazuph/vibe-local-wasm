@@ -10,6 +10,7 @@
 
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -19,21 +20,217 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const VIBE_CODER_PATH = path.resolve(__dirname, "pyodide-core/vibe-coder.py");
+const EXECUTION_ROOT = path.resolve(process.cwd());
+const TMP_ROOT = path.resolve(tmpdir());
+const SANDBOX_HOME = path.join(TMP_ROOT, "vibe-local-wasm-home");
+const SANDBOX_CONFIG_HOME = path.join(SANDBOX_HOME, ".config");
+const SANDBOX_CACHE_HOME = path.join(SANDBOX_HOME, ".cache");
+const SANDBOX_DATA_HOME = path.join(SANDBOX_HOME, ".local", "share");
+const SYSTEM_EXEC_DIRS = [
+  "/bin",
+  "/sbin",
+  "/usr/bin",
+  "/usr/sbin",
+  "/usr/libexec",
+  "/usr/local/bin",
+  "/opt/homebrew/bin",
+];
+const BLOCKED_EXECUTABLES = new Set([
+  "sh",
+  "bash",
+  "dash",
+  "zsh",
+  "fish",
+  "python",
+  "python3",
+  "node",
+  "nodejs",
+  "ruby",
+  "perl",
+  "php",
+  "lua",
+  "osascript",
+]);
+const PATH_VALUE_FLAGS = new Set(["-C", "--git-dir", "--work-tree", "--file", "--output", "--input"]);
+
+mkdirSync(SANDBOX_HOME, { recursive: true });
+mkdirSync(SANDBOX_CONFIG_HOME, { recursive: true });
+mkdirSync(SANDBOX_CACHE_HOME, { recursive: true });
+mkdirSync(SANDBOX_DATA_HOME, { recursive: true });
+
+function isPathInside(root: string, candidate: string) {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function isAllowedAccessPath(candidate: string) {
+  return isPathInside(EXECUTION_ROOT, candidate) || isPathInside(TMP_ROOT, candidate);
+}
+
+function resolveAccessPath(raw: string, baseDir = EXECUTION_ROOT) {
+  if (!raw) throw new Error("Empty path");
+  const absolute = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(baseDir, raw);
+  if (!isAllowedAccessPath(absolute)) {
+    throw new Error(`Path outside execution root is not allowed: ${raw}`);
+  }
+  return absolute;
+}
+
+function resolveExecutionCwd(raw?: string) {
+  if (!raw) {
+    return EXECUTION_ROOT;
+  }
+  const resolved = resolveAccessPath(raw, EXECUTION_ROOT);
+  if (!existsSync(resolved)) {
+    throw new Error(`Working directory does not exist: ${raw}`);
+  }
+  return resolved;
+}
+
+function isSystemExecutablePath(candidate: string) {
+  return SYSTEM_EXEC_DIRS.some((root) => isPathInside(root, candidate));
+}
+
+function resolveExecutable(command: string, cwd: string) {
+  const executableName = path.basename(command);
+  if (BLOCKED_EXECUTABLES.has(executableName)) {
+    throw new Error(`Executable '${executableName}' is blocked by the access policy`);
+  }
+  if (!command.includes("/") && !path.isAbsolute(command)) {
+    return command;
+  }
+  const absolute = path.isAbsolute(command) ? path.resolve(command) : path.resolve(cwd, command);
+  if (!isAllowedAccessPath(absolute) && !isSystemExecutablePath(absolute)) {
+    throw new Error(`Executable outside execution root is not allowed: ${command}`);
+  }
+  return absolute;
+}
+
+function looksLikeUrl(value: string) {
+  return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(value);
+}
+
+function validatePathLikeArg(value: string, cwd: string) {
+  if (!value || value === "-" || looksLikeUrl(value)) {
+    return;
+  }
+  if (
+    path.isAbsolute(value) ||
+    value === "." ||
+    value === ".." ||
+    value.startsWith("./") ||
+    value.startsWith("../") ||
+    value.includes("/")
+  ) {
+    resolveAccessPath(value, cwd);
+  }
+}
+
+function validateCommandArgs(args: string[], cwd: string) {
+  let expectPathValue = false;
+  for (const arg of args) {
+    if (expectPathValue) {
+      validatePathLikeArg(arg, cwd);
+      expectPathValue = false;
+      continue;
+    }
+    if (PATH_VALUE_FLAGS.has(arg)) {
+      expectPathValue = true;
+      continue;
+    }
+    if (arg.startsWith("--git-dir=") || arg.startsWith("--work-tree=")) {
+      validatePathLikeArg(arg.split("=", 2)[1] ?? "", cwd);
+      continue;
+    }
+    validatePathLikeArg(arg, cwd);
+  }
+}
+
+function splitCommand(command: string) {
+  const args: string[] = [];
+  let current = "";
+  let quote: "'" | "\"" | null = null;
+  let escaped = false;
+
+  for (const char of command) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+    if (char === "'" || char === "\"") {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) {
+        args.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += char;
+  }
+
+  if (escaped || quote) {
+    throw new Error("Unterminated quoted argument.");
+  }
+  if (current) {
+    args.push(current);
+  }
+  return args;
+}
+
+function childProcessEnv() {
+  return {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+    HOME: SANDBOX_HOME,
+    XDG_CACHE_HOME: SANDBOX_CACHE_HOME,
+    XDG_CONFIG_HOME: SANDBOX_CONFIG_HOME,
+    XDG_DATA_HOME: SANDBOX_DATA_HOME,
+    npm_config_userconfig: "/dev/null",
+    PIP_CONFIG_FILE: "/dev/null",
+    PYTHONNOUSERSITE: "1",
+  };
+}
+
+function runRestrictedCommand(argv: string[], cwd: string, timeoutMs: number) {
+  if (argv.length === 0) {
+    throw new Error("Empty argv");
+  }
+  const effectiveCwd = resolveExecutionCwd(cwd);
+  const [rawExecutable, ...args] = argv;
+  const executable = resolveExecutable(rawExecutable, effectiveCwd);
+  validateCommandArgs(args, effectiveCwd);
+  return execFileSync(executable, args, {
+    cwd: effectiveCwd,
+    encoding: "utf8",
+    env: childProcessEnv(),
+    maxBuffer: 32 * 1024 * 1024,
+    timeout: timeoutMs > 0 ? timeoutMs : 60_000,
+  });
+}
 
 /**
- * Resolve a tool-provided path against the repo root. Mirrors the behavior
- * of resolveRepoPath in vibe-local-actor.ts but tolerates absolute paths
- * that already live inside the repo.
+ * Resolve a tool-provided path against the execution root. Absolute paths are
+ * allowed only when they stay inside the current execution directory or /tmp.
  */
 function resolveHostPath(raw: string): string {
-  if (!raw) throw new Error("Empty path");
-  const abs = path.isAbsolute(raw) ? raw : path.resolve(REPO_ROOT, raw);
-  // Basic guard: don't let tool paths escape the repo
-  if (!abs.startsWith(REPO_ROOT) && !abs.startsWith("/tmp/")) {
-    // Relaxed: still allow /tmp for tests, but reject arbitrary system paths
-    throw new Error(`Path outside repo root is not allowed: ${raw}`);
-  }
-  return abs;
+  return resolveAccessPath(raw, EXECUTION_ROOT);
 }
 
 let pyPromise: Promise<unknown> | null = null;
@@ -126,19 +323,16 @@ async function initPyodide() {
       if (argv.length === 0) {
         return JSON.stringify({ ok: false, stdout: "", stderr: "Empty argv", exit_code: null });
       }
-      const [cmd, ...cmdArgs] = argv;
-      // Pyodide's os.getcwd() returns virtual paths like /home/pyodide that
-      // don't exist on the host. Fall back to undefined (Node's cwd) if the
-      // requested cwd is empty OR not a real directory on the host.
-      const effectiveCwd =
-        cwd && cwd.length > 0 && existsSync(cwd) ? cwd : undefined;
       try {
-        const stdout = execFileSync(cmd, cmdArgs, {
-          cwd: effectiveCwd,
-          encoding: "utf8",
-          maxBuffer: 32 * 1024 * 1024,
-          timeout: timeoutMs > 0 ? timeoutMs : 60_000,
-        });
+        if (argv[0] === "sh" && argv[1] === "-c") {
+          return JSON.stringify({
+            ok: false,
+            stdout: "",
+            stderr: "shell=true subprocess execution is blocked by the access policy",
+            exit_code: null,
+          });
+        }
+        const stdout = runRestrictedCommand(argv, cwd, timeoutMs);
         return JSON.stringify({ ok: true, stdout, stderr: "", exit_code: 0 });
       } catch (err) {
         const e = err as {
@@ -188,12 +382,8 @@ async function initPyodide() {
             if (!cmd) return JSON.stringify({ ok: false, error: "No command" });
             const timeoutMs = Number(params.timeout ?? 120_000);
             try {
-              const stdout = execFileSync("sh", ["-c", cmd], {
-                cwd: REPO_ROOT,
-                encoding: "utf8",
-                maxBuffer: 32 * 1024 * 1024,
-                timeout: timeoutMs > 0 ? timeoutMs : 120_000,
-              });
+              const argv = splitCommand(cmd);
+              const stdout = runRestrictedCommand(argv, EXECUTION_ROOT, timeoutMs);
               return JSON.stringify({ ok: true, output: stdout.trim() || "(no output)" });
             } catch (err) {
               const e = err as {
@@ -256,7 +446,13 @@ async function initPyodide() {
               const stdout = execFileSync(
                 "rg",
                 ["--files", "--hidden", "--glob", pattern, "--glob", "!**/node_modules/**", "--glob", "!**/.git/**"],
-                { cwd: REPO_ROOT, encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 20_000 },
+                {
+                  cwd: EXECUTION_ROOT,
+                  encoding: "utf8",
+                  env: childProcessEnv(),
+                  maxBuffer: 16 * 1024 * 1024,
+                  timeout: 20_000,
+                },
               );
               const files = stdout.split("\n").filter(Boolean).slice(0, 100);
               return JSON.stringify({ ok: true, output: files.join("\n") || "(no matches)" });
@@ -273,9 +469,10 @@ async function initPyodide() {
             if (params.path) rgArgs.push("-g", String(params.path));
             rgArgs.push(pattern, REPO_ROOT);
             try {
-              const stdout = execFileSync("rg", rgArgs, {
-                cwd: REPO_ROOT,
+             const stdout = execFileSync("rg", rgArgs, {
+                cwd: EXECUTION_ROOT,
                 encoding: "utf8",
+                env: childProcessEnv(),
                 maxBuffer: 16 * 1024 * 1024,
                 timeout: 20_000,
               });
