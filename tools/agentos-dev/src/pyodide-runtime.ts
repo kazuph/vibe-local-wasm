@@ -9,7 +9,17 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -206,6 +216,490 @@ function childProcessEnv() {
     PIP_CONFIG_FILE: "/dev/null",
     PYTHONNOUSERSITE: "1",
   };
+}
+
+const WEB_SEARCH_MIN_INTERVAL_MS = 2_000;
+const WEB_SEARCH_MAX_PER_SESSION = 50;
+let lastWebSearchAt = 0;
+let webSearchCount = 0;
+
+type RuntimeTaskStatus = "pending" | "in_progress" | "completed" | "deleted";
+
+type RuntimeTask = {
+  id: string;
+  subject: string;
+  description: string;
+  activeForm: string;
+  status: RuntimeTaskStatus;
+  blocks: string[];
+  blockedBy: string[];
+};
+
+let nextTaskId = 1;
+const runtimeTasks = new Map<string, RuntimeTask>();
+
+function sleepSync(ms: number) {
+  if (ms <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function stripHtml(text: string) {
+  return text
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&#39;/gi, "'")
+    .replace(/&quot;/gi, '"')
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function decodeDuckDuckGoUrl(rawUrl: string) {
+  if (!rawUrl) return "";
+  try {
+    const parsed = new URL(rawUrl, "https://duckduckgo.com");
+    const uddg = parsed.searchParams.get("uddg");
+    if (uddg) {
+      return decodeURIComponent(uddg);
+    }
+    if (rawUrl.startsWith("//")) {
+      return `https:${rawUrl}`;
+    }
+    return parsed.toString();
+  } catch {
+    return rawUrl.startsWith("//") ? `https:${rawUrl}` : rawUrl;
+  }
+}
+
+function formatWebSearchResults(
+  query: string,
+  results: Array<{ title: string; url: string; snippet: string }>,
+) {
+  if (results.length === 0) {
+    return `No search results found for "${query}".`;
+  }
+  const lines = [`Search results for: ${query}`, ""];
+  results.forEach((result, index) => {
+    lines.push(`${index + 1}. ${result.title}`);
+    lines.push(`   ${result.url}`);
+    if (result.snippet) {
+      lines.push(`   ${result.snippet}`);
+    }
+    lines.push("");
+  });
+  return lines.join("\n").trimEnd();
+}
+
+function parseDuckDuckGoResults(html: string, maxResults = 8) {
+  const results: Array<{ title: string; url: string; snippet: string }> = [];
+  const titleLinkRegex =
+    /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/g;
+
+  let match: RegExpExecArray | null;
+  while ((match = titleLinkRegex.exec(html)) !== null && results.length < maxResults) {
+    const url = decodeDuckDuckGoUrl(match[1] ?? "");
+    const title = stripHtml(match[2] ?? "");
+    if (!url || !title) continue;
+    if (url.includes("/y.js?") || url.includes("ad_provider") || url.includes("duckduckgo.com/y.js")) {
+      continue;
+    }
+
+    const nearbyHtml = html.slice(match.index, match.index + 2_000);
+    const snippetMatch = nearbyHtml.match(
+      /<[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/[^>]+>/,
+    );
+    const snippet = stripHtml(snippetMatch?.[1] ?? "");
+    results.push({ title, url, snippet });
+  }
+
+  return results;
+}
+
+function runWebSearch(query: string) {
+  if (!query.trim()) {
+    throw new Error("query required");
+  }
+  if (webSearchCount >= WEB_SEARCH_MAX_PER_SESSION) {
+    return "Error: search limit reached for this session. Use WebFetch on specific URLs instead.";
+  }
+
+  const now = Date.now();
+  const waitMs = WEB_SEARCH_MIN_INTERVAL_MS - (now - lastWebSearchAt);
+  if (waitMs > 0) {
+    sleepSync(waitMs);
+  }
+  lastWebSearchAt = Date.now();
+  webSearchCount += 1;
+
+  const lang = String(process.env.LANG ?? "").toLowerCase();
+  const region = lang.includes("ja")
+    ? "jp-ja"
+    : lang.includes("zh")
+      ? "cn-zh"
+      : lang.includes("ko")
+        ? "kr-kr"
+        : "wt-wt";
+  const url = `https://html.duckduckgo.com/html/?${new URLSearchParams({ q: query, kl: region }).toString()}`;
+
+  try {
+    const html = execFileSync(
+      "curl",
+      [
+        "-s",
+        "-L",
+        "--max-time",
+        "30",
+        "-A",
+        "vibe-local-wasm/1.0 (+https://github.com/ochyai/vibe-local)",
+        "-H",
+        `Accept-Language: ${lang.includes("ja") ? "ja,en;q=0.9" : "en-US,en;q=0.9"}`,
+        url,
+      ],
+      {
+        encoding: "utf8",
+        env: childProcessEnv(),
+        maxBuffer: 8 * 1024 * 1024,
+        timeout: 35_000,
+      },
+    );
+    const lowered = html.toLowerCase();
+    if (
+      (lowered.includes("captcha") ||
+        lowered.includes("verify you are human") ||
+        lowered.includes("are you a robot") ||
+        lowered.includes("unusual traffic")) &&
+      !html.includes('class="result__a"')
+    ) {
+      return "Web search blocked by CAPTCHA. You may be rate-limited. Try again later or use WebFetch on a specific URL.";
+    }
+    return formatWebSearchResults(query, parseDuckDuckGoResults(html));
+  } catch (err) {
+    return `Web search failed (network error): ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+function splitNotebookSourceLines(source: string) {
+  if (source === "") return [];
+  return source.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+}
+
+function writeNotebookAtomically(notebookPath: string, notebook: unknown) {
+  const tmpPath = `${notebookPath}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tmpPath, `${JSON.stringify(notebook, null, 1)}\n`, "utf8");
+  try {
+    renameSync(tmpPath, notebookPath);
+  } catch (err) {
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // ignore cleanup errors
+    }
+    throw err;
+  }
+}
+
+function editNotebook(params: Record<string, unknown>) {
+  const rawPath = String(params.notebook_path ?? "");
+  if (!rawPath) {
+    throw new Error("no notebook_path provided");
+  }
+
+  const notebookPath = resolveHostPath(rawPath);
+  const rawCellNumber = Number(params.cell_number ?? 0);
+  if (!Number.isFinite(rawCellNumber) || !Number.isInteger(rawCellNumber)) {
+    throw new Error("cell_number must be a number");
+  }
+  if (rawCellNumber < 0) {
+    throw new Error("cell_number cannot be negative");
+  }
+  const cellNumber = rawCellNumber;
+  const newSource = String(params.new_source ?? "");
+  const editMode = String(params.edit_mode ?? "replace");
+  const rawCellType = params.cell_type;
+  const cellType = rawCellType === undefined || rawCellType === null ? undefined : String(rawCellType);
+  if (cellType !== undefined && !["code", "markdown", "raw"].includes(cellType)) {
+    throw new Error(`invalid cell_type '${cellType}'. Must be: code, markdown, or raw`);
+  }
+
+  let notebook: unknown;
+  try {
+    notebook = JSON.parse(readFileSync(notebookPath, "utf8"));
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      throw new Error(`notebook is not valid JSON: ${err.message}`);
+    }
+    throw new Error(`reading notebook: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (typeof notebook !== "object" || notebook === null || !("cells" in notebook)) {
+    throw new Error("notebook has no 'cells' key — may be corrupted");
+  }
+
+  const mutableNotebook = notebook as { cells?: unknown[] };
+  if (!Array.isArray(mutableNotebook.cells)) {
+    throw new Error("notebook 'cells' is not a list — may be corrupted");
+  }
+  const cells = mutableNotebook.cells as Array<Record<string, unknown>>;
+
+  if (editMode === "insert") {
+    const effectiveCellType = cellType ?? "code";
+    const newCell: Record<string, unknown> = {
+      cell_type: effectiveCellType,
+      metadata: {},
+      source: splitNotebookSourceLines(newSource),
+    };
+    if (effectiveCellType === "code") {
+      newCell.outputs = [];
+      newCell.execution_count = null;
+    }
+    cells.splice(Math.min(cellNumber, cells.length), 0, newCell);
+  } else if (editMode === "delete") {
+    if (cellNumber >= cells.length) {
+      throw new Error(`cell ${cellNumber} out of range (0-${cells.length - 1})`);
+    }
+    cells.splice(cellNumber, 1);
+  } else if (editMode === "replace") {
+    if (cellNumber >= cells.length) {
+      throw new Error(`cell ${cellNumber} out of range (0-${cells.length - 1})`);
+    }
+    const existingCell = cells[cellNumber] ?? {};
+    const oldType = String(existingCell.cell_type ?? "code");
+    const effectiveCellType = cellType ?? oldType;
+    existingCell.source = splitNotebookSourceLines(newSource);
+    existingCell.cell_type = effectiveCellType;
+    if (oldType === "code" && effectiveCellType !== "code") {
+      delete existingCell.outputs;
+      delete existingCell.execution_count;
+    } else if (oldType !== "code" && effectiveCellType === "code") {
+      existingCell.outputs ??= [];
+      existingCell.execution_count ??= null;
+    }
+    cells[cellNumber] = existingCell;
+  } else {
+    throw new Error("edit_mode must be one of: replace, insert, delete");
+  }
+
+  mutableNotebook.cells = cells;
+  writeNotebookAtomically(notebookPath, mutableNotebook);
+  return `Notebook ${editMode}d cell ${cellNumber} in ${notebookPath}`;
+}
+
+function formatTaskList() {
+  if (runtimeTasks.size === 0) {
+    return "No tasks.";
+  }
+  const lines = Array.from(runtimeTasks.entries())
+    .sort((a, b) => Number(a[0]) - Number(b[0]))
+    .map(([taskId, task]) => {
+      const openBlockers = task.blockedBy.filter((blockerId) => {
+        const blocker = runtimeTasks.get(blockerId);
+        return blocker !== undefined && blocker.status !== "completed";
+      });
+      const blocked = openBlockers.length > 0 ? `  blockedBy: [${openBlockers.join(", ")}]` : "";
+      return `  #${taskId}. [${task.status}] ${task.subject}${blocked}`;
+    });
+  return `Tasks:\n${lines.join("\n")}`;
+}
+
+function getReachableTaskIds(startId: string) {
+  const visited = new Set<string>();
+  const stack = [startId];
+  while (stack.length > 0) {
+    const currentId = stack.pop();
+    if (!currentId || visited.has(currentId)) continue;
+    visited.add(currentId);
+    const task = runtimeTasks.get(currentId);
+    if (task) {
+      stack.push(...task.blocks);
+    }
+  }
+  return visited;
+}
+
+function createTask(params: Record<string, unknown>) {
+  const subject = String(params.subject ?? "").trim();
+  const description = String(params.description ?? "").trim();
+  const activeFormRaw = String(params.activeForm ?? "").trim();
+  if (!subject) {
+    throw new Error("subject is required");
+  }
+  if (!description) {
+    throw new Error("description is required");
+  }
+  if (runtimeTasks.size >= 200) {
+    return "Error: task limit reached (200). Delete old tasks before creating new ones.";
+  }
+  const taskId = String(nextTaskId++);
+  runtimeTasks.set(taskId, {
+    id: taskId,
+    subject,
+    description,
+    activeForm: activeFormRaw || `Working on: ${subject}`,
+    status: "pending",
+    blocks: [],
+    blockedBy: [],
+  });
+  return `Created task #${taskId}: ${subject}`;
+}
+
+function getTask(params: Record<string, unknown>) {
+  const taskId = String(params.taskId ?? "").trim();
+  if (!taskId) {
+    throw new Error("taskId is required");
+  }
+  const task = runtimeTasks.get(taskId);
+  if (!task) {
+    return `Error: task #${taskId} not found`;
+  }
+  const lines = [
+    `Task #${taskId}`,
+    `  Subject: ${task.subject}`,
+    `  Status: ${task.status}`,
+    `  ActiveForm: ${task.activeForm}`,
+    `  Description: ${task.description}`,
+  ];
+  if (task.blocks.length > 0) {
+    lines.push(`  Blocks: [${task.blocks.join(", ")}]`);
+  }
+  if (task.blockedBy.length > 0) {
+    lines.push(`  BlockedBy: [${task.blockedBy.join(", ")}]`);
+  }
+  return lines.join("\n");
+}
+
+function updateTask(params: Record<string, unknown>) {
+  const taskId = String(params.taskId ?? "").trim();
+  if (!taskId) {
+    throw new Error("taskId is required");
+  }
+  const task = runtimeTasks.get(taskId);
+  if (!task) {
+    return `Error: task #${taskId} not found`;
+  }
+
+  const status = params.status;
+  if (status !== undefined && status !== null && status !== "") {
+    const nextStatus = String(status);
+    if (!["pending", "in_progress", "completed", "deleted"].includes(nextStatus)) {
+      return `Error: invalid status '${nextStatus}'. Must be: completed, deleted, in_progress, pending`;
+    }
+    if (nextStatus === "deleted") {
+      runtimeTasks.delete(taskId);
+      for (const otherTask of runtimeTasks.values()) {
+        otherTask.blocks = otherTask.blocks.filter((value) => value !== taskId);
+        otherTask.blockedBy = otherTask.blockedBy.filter((value) => value !== taskId);
+      }
+      return `Deleted task #${taskId}`;
+    }
+    task.status = nextStatus as RuntimeTaskStatus;
+  }
+
+  if (typeof params.subject === "string" && params.subject) {
+    task.subject = params.subject;
+  }
+  if (typeof params.description === "string" && params.description) {
+    task.description = params.description;
+  }
+
+  const addBlocks = Array.isArray(params.addBlocks) ? params.addBlocks.map(String) : [];
+  for (const blockId of addBlocks) {
+    if (getReachableTaskIds(blockId).has(taskId)) {
+      return `Error: adding block #${blockId} would create a dependency cycle`;
+    }
+    if (!task.blocks.includes(blockId)) {
+      task.blocks.push(blockId);
+    }
+    const otherTask = runtimeTasks.get(blockId);
+    if (otherTask && !otherTask.blockedBy.includes(taskId)) {
+      otherTask.blockedBy.push(taskId);
+    }
+  }
+
+  const addBlockedBy = Array.isArray(params.addBlockedBy) ? params.addBlockedBy.map(String) : [];
+  for (const blockerId of addBlockedBy) {
+    if (getReachableTaskIds(taskId).has(blockerId)) {
+      return `Error: adding blockedBy #${blockerId} would create a dependency cycle`;
+    }
+    if (!task.blockedBy.includes(blockerId)) {
+      task.blockedBy.push(blockerId);
+    }
+    const otherTask = runtimeTasks.get(blockerId);
+    if (otherTask && !otherTask.blocks.includes(taskId)) {
+      otherTask.blocks.push(taskId);
+    }
+  }
+
+  return `Updated task #${taskId}: [${task.status}] ${task.subject}`;
+}
+
+function readLineFromTerminal(prompt: string) {
+  const buffer = Buffer.alloc(1);
+  const useTty = process.stdin.isTTY;
+  const fd = useTty ? openSync("/dev/tty", "rs") : process.stdin.fd;
+  let output = "";
+  try {
+    process.stdout.write(prompt);
+    while (true) {
+      const bytesRead = readSync(fd, buffer, 0, 1, null);
+      if (bytesRead === 0) {
+        return output === "" ? null : output;
+      }
+      const chunk = buffer.toString("utf8", 0, bytesRead);
+      if (chunk === "\r") {
+        continue;
+      }
+      if (chunk === "\n") {
+        break;
+      }
+      output += chunk;
+    }
+    return output;
+  } finally {
+    if (useTty) {
+      closeSync(fd);
+    }
+  }
+}
+
+function askUserQuestion(params: Record<string, unknown>) {
+  const question = String(params.question ?? "").trim();
+  if (!question) {
+    throw new Error("question is required");
+  }
+  const options = Array.isArray(params.options) ? params.options.map(String) : [];
+  process.stdout.write(`\nQuestion: ${question}\n`);
+  if (options.length > 0) {
+    options.forEach((option, index) => {
+      process.stdout.write(`  ${index + 1}. ${option}\n`);
+    });
+    process.stdout.write("  Enter number or type your own answer:\n");
+  } else {
+    process.stdout.write("  Type your answer:\n");
+  }
+
+  let answer: string | null;
+  try {
+    answer = readLineFromTerminal("  > ");
+  } catch {
+    return "User cancelled the question.";
+  }
+  if (answer === null) {
+    return "User cancelled the question.";
+  }
+  const trimmed = answer.trim();
+  if (!trimmed) {
+    return "User provided no answer.";
+  }
+  if (options.length > 0 && /^\d+$/.test(trimmed)) {
+    const index = Number(trimmed) - 1;
+    if (index >= 0 && index < options.length) {
+      return `User chose: ${options[index]}`;
+    }
+  }
+  return `User answered: ${trimmed}`;
 }
 
 function runRestrictedCommand(argv: string[], cwd: string, timeoutMs: number) {
@@ -493,15 +987,65 @@ async function initPyodide() {
                 ["-s", "-L", "--max-time", "30", "-A", "vibe-local-wasm/1.0", url],
                 { encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 35_000 },
               );
-              // Strip HTML tags crudely for agent readability
-              const text = out
-                .replace(/<script[\s\S]*?<\/script>/gi, "")
-                .replace(/<style[\s\S]*?<\/style>/gi, "")
-                .replace(/<[^>]+>/g, " ")
-                .replace(/\s+/g, " ")
-                .trim()
-                .slice(0, 5000);
-              return JSON.stringify({ ok: true, output: text || "(empty)" });
+               const text = stripHtml(out).slice(0, 5000);
+               return JSON.stringify({ ok: true, output: text || "(empty)" });
+             } catch (err) {
+               return JSON.stringify({
+                 ok: false,
+                 error: err instanceof Error ? err.message : String(err),
+               });
+             }
+           }
+          case "WebSearch": {
+            const query = String(params.query ?? "");
+            return JSON.stringify({ ok: true, output: runWebSearch(query) });
+          }
+          case "NotebookEdit": {
+            try {
+              return JSON.stringify({ ok: true, output: editNotebook(params) });
+            } catch (err) {
+              return JSON.stringify({
+                ok: false,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+          case "TaskCreate": {
+            try {
+              return JSON.stringify({ ok: true, output: createTask(params) });
+            } catch (err) {
+              return JSON.stringify({
+                ok: false,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+          case "TaskList": {
+            return JSON.stringify({ ok: true, output: formatTaskList() });
+          }
+          case "TaskGet": {
+            try {
+              return JSON.stringify({ ok: true, output: getTask(params) });
+            } catch (err) {
+              return JSON.stringify({
+                ok: false,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+          case "TaskUpdate": {
+            try {
+              return JSON.stringify({ ok: true, output: updateTask(params) });
+            } catch (err) {
+              return JSON.stringify({
+                ok: false,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+          case "AskUserQuestion": {
+            try {
+              return JSON.stringify({ ok: true, output: askUserQuestion(params) });
             } catch (err) {
               return JSON.stringify({
                 ok: false,
