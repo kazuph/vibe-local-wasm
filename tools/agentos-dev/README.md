@@ -47,7 +47,7 @@ CLI からは同じ `vibeLocal` actor を直接叩き、会話・compact artifac
 
 1. ツール実行の強化
 2. `Plan / Act / approve` フロー
-3. サブエージェント / 並列エージェント
+3. サブエージェント / 並列エージェント（Phase 6 で bridge 済み）
 
 次は採用しません。
 

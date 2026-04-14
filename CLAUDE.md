@@ -85,7 +85,7 @@ CLI → actor.runAgentTurn(prompt)
 
 ### ブリッジ経由のツール (`_js_tool_dispatch`)
 
-`Bash` / `Read` / `Write` / `Edit` / `Glob` / `Grep` / `WebFetch` / `WebSearch` / `NotebookEdit` / `TaskCreate` / `TaskList` / `TaskGet` / `TaskUpdate` / `AskUserQuestion` は JS 側で処理される。`SubAgent` / `ParallelAgents` は未 bridge のまま。
+`Bash` / `Read` / `Write` / `Edit` / `Glob` / `Grep` / `WebFetch` / `WebSearch` / `NotebookEdit` / `TaskCreate` / `TaskList` / `TaskGet` / `TaskUpdate` / `AskUserQuestion` / `SubAgent` / `ParallelAgents` は JS bridge 経由で処理される。`SubAgent` と `ParallelAgents` は bridge 側の mini-agent loop と worker coordination で実装している。
 
 ### パフォーマンス
 
@@ -190,7 +190,7 @@ CLI → vibeLocal actor → Pyodide runtime → agentOS Manager surfaces
 - **Actor-local SQLite for conversations**: 現行の CLI path では会話本体も設定読み出しも host/actor 側を主に使う。
 - **AgentFS is a mirror/audit layer**: Host filesystem is always the source of truth; AgentFS provides parallel tracking.
 - **Execution modes**: Plan / Act（本家準拠）。YOLO は本家の `--yes` フラグに相当。
-- **本家で実装済みだがこちらで未実装**: file watcher, auto-test loop, MCP連携, `/undo`, `SubAgent`, `ParallelAgents`
+- **本家で実装済みだがこちらで未実装**: file watcher, auto-test loop, MCP連携, `/undo`
 
 ## Technology Stack
 

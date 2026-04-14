@@ -22,7 +22,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { Worker, isMainThread, workerData } from "node:worker_threads";
 
 import { REPO_ROOT } from "./config.js";
 
@@ -222,6 +223,13 @@ const WEB_SEARCH_MIN_INTERVAL_MS = 2_000;
 const WEB_SEARCH_MAX_PER_SESSION = 50;
 let lastWebSearchAt = 0;
 let webSearchCount = 0;
+type RuntimeAgentContext = {
+  baseUrl: string;
+  model: string;
+  maxTokens: number;
+  temperature: number;
+};
+let currentAgentContext: RuntimeAgentContext | null = null;
 
 type RuntimeTaskStatus = "pending" | "in_progress" | "completed" | "deleted";
 
@@ -702,6 +710,516 @@ function askUserQuestion(params: Record<string, unknown>) {
   return `User answered: ${trimmed}`;
 }
 
+function buildFunctionSchema(
+  name: string,
+  description: string,
+  properties: Record<string, unknown>,
+  required: string[] = [],
+) {
+  return {
+    type: "function",
+    function: {
+      name,
+      description,
+      parameters: {
+        type: "object",
+        properties,
+        required,
+      },
+    },
+  };
+}
+
+const SUBAGENT_TOOL_SCHEMAS = {
+  Read: buildFunctionSchema(
+    "Read",
+    "Read a file from disk with optional offset and line limit.",
+    {
+      file_path: { type: "string", description: "Path to the file to read" },
+      offset: { type: "integer", description: "0-indexed line offset" },
+      limit: { type: "integer", description: "Maximum number of lines to read" },
+    },
+    ["file_path"],
+  ),
+  Glob: buildFunctionSchema(
+    "Glob",
+    "Find files matching a glob pattern.",
+    {
+      pattern: { type: "string", description: "Glob pattern to match" },
+    },
+    ["pattern"],
+  ),
+  Grep: buildFunctionSchema(
+    "Grep",
+    "Search file contents with ripgrep.",
+    {
+      pattern: { type: "string", description: "Regex pattern to search for" },
+      path: { type: "string", description: "Optional glob filter for files" },
+    },
+    ["pattern"],
+  ),
+  WebFetch: buildFunctionSchema(
+    "WebFetch",
+    "Fetch a URL and return readable text content.",
+    {
+      url: { type: "string", description: "URL to fetch" },
+    },
+    ["url"],
+  ),
+  WebSearch: buildFunctionSchema(
+    "WebSearch",
+    "Search the web using DuckDuckGo and return titles, URLs, and snippets.",
+    {
+      query: { type: "string", description: "Search query" },
+    },
+    ["query"],
+  ),
+  Bash: buildFunctionSchema(
+    "Bash",
+    "Run a shell command within the allowed execution root.",
+    {
+      command: { type: "string", description: "Command to run" },
+      timeout: { type: "integer", description: "Timeout in milliseconds" },
+    },
+    ["command"],
+  ),
+  Write: buildFunctionSchema(
+    "Write",
+    "Write full file contents to disk.",
+    {
+      file_path: { type: "string", description: "Path to the file to write" },
+      content: { type: "string", description: "Complete file contents" },
+    },
+    ["file_path", "content"],
+  ),
+  Edit: buildFunctionSchema(
+    "Edit",
+    "Replace text inside a file.",
+    {
+      file_path: { type: "string", description: "Path to the file to edit" },
+      old_string: { type: "string", description: "Text to replace" },
+      new_string: { type: "string", description: "Replacement text" },
+      replace_all: { type: "boolean", description: "Replace all occurrences" },
+    },
+    ["file_path", "old_string", "new_string"],
+  ),
+} as const;
+
+function chatCompletionsSync(
+  context: RuntimeAgentContext,
+  messages: Array<Record<string, unknown>>,
+  tools?: Array<Record<string, unknown>>,
+) {
+  const url = `${context.baseUrl.replace(/\/$/, "")}/v1/chat/completions`;
+  const headers = [
+    "-H",
+    "Content-Type: application/json",
+  ];
+  if (process.env.OPENAI_API_KEY) {
+    headers.push("-H", `Authorization: Bearer ${process.env.OPENAI_API_KEY}`);
+  }
+  const body = JSON.stringify({
+    model: context.model,
+    messages,
+    tools: tools && tools.length > 0 ? tools : undefined,
+    stream: false,
+    max_tokens: context.maxTokens,
+    temperature: context.temperature,
+  });
+  const raw = execFileSync(
+    "curl",
+    ["-sS", "-L", "--max-time", "60", "-X", "POST", url, ...headers, "--data-raw", body],
+    {
+      encoding: "utf8",
+      env: childProcessEnv(),
+      maxBuffer: 16 * 1024 * 1024,
+      timeout: 65_000,
+    },
+  );
+  const parsed = JSON.parse(raw) as Record<string, any>;
+  if (parsed.error) {
+    const message =
+      typeof parsed.error === "string"
+        ? parsed.error
+        : parsed.error.message ?? JSON.stringify(parsed.error);
+    throw new Error(message);
+  }
+  if (Array.isArray(parsed.choices)) {
+    return (parsed.choices[0]?.message ?? {}) as Record<string, any>;
+  }
+  if (parsed.message && typeof parsed.message === "object") {
+    return parsed.message as Record<string, any>;
+  }
+  throw new Error("Unexpected chat response shape");
+}
+
+function executeSubAgentAllowedTool(name: string, params: Record<string, unknown>) {
+  switch (name) {
+    case "Bash": {
+      const cmd = String(params.command ?? "");
+      if (!cmd) return { ok: false, error: "No command" };
+      const timeoutMs = Number(params.timeout ?? 120_000);
+      try {
+        const argv = splitCommand(cmd);
+        const stdout = runRestrictedCommand(argv, EXECUTION_ROOT, timeoutMs);
+        return { ok: true, output: stdout.trim() || "(no output)" };
+      } catch (err) {
+        const e = err as { stdout?: Buffer | string; stderr?: Buffer | string; code?: number; message?: string };
+        const so = typeof e.stdout === "string" ? e.stdout : e.stdout?.toString("utf8") ?? "";
+        const se = typeof e.stderr === "string" ? e.stderr : e.stderr?.toString("utf8") ?? e.message ?? "";
+        const rc = typeof e.code === "number" ? e.code : -1;
+        return { ok: true, output: [so, se].filter(Boolean).join("\n") + `\n(exit code: ${rc})` };
+      }
+    }
+    case "Read": {
+      const filePath = resolveHostPath(String(params.file_path ?? ""));
+      const offset = Number(params.offset ?? 0);
+      const limit = Number(params.limit ?? 2000);
+      const content = readFileSync(filePath, "utf8");
+      const lines = content.split("\n");
+      const numbered = lines
+        .slice(offset, offset + limit)
+        .map((line, i) => `${String(offset + i + 1).padStart(6)}\t${line}`)
+        .join("\n");
+      return { ok: true, output: numbered };
+    }
+    case "Write": {
+      const filePath = resolveHostPath(String(params.file_path ?? ""));
+      const content = String(params.content ?? "");
+      mkdirSync(path.dirname(filePath), { recursive: true });
+      writeFileSync(filePath, content, "utf8");
+      return {
+        ok: true,
+        output: `Wrote ${content.length} chars to ${path.relative(REPO_ROOT, filePath) || filePath}`,
+      };
+    }
+    case "Edit": {
+      const filePath = resolveHostPath(String(params.file_path ?? ""));
+      const oldStr = String(params.old_string ?? "");
+      const newStr = String(params.new_string ?? "");
+      const replaceAll = Boolean(params.replace_all);
+      if (!oldStr) return { ok: false, error: "old_string is required" };
+      const before = readFileSync(filePath, "utf8");
+      if (!before.includes(oldStr)) {
+        return { ok: false, error: `old_string not found in ${filePath}` };
+      }
+      const after = replaceAll ? before.split(oldStr).join(newStr) : before.replace(oldStr, newStr);
+      writeFileSync(filePath, after, "utf8");
+      return { ok: true, output: `Edited ${path.relative(REPO_ROOT, filePath) || filePath}` };
+    }
+    case "Glob": {
+      const pattern = String(params.pattern ?? "");
+      if (!pattern) return { ok: false, error: "pattern required" };
+      try {
+        const stdout = execFileSync(
+          "rg",
+          ["--files", "--hidden", "--glob", pattern, "--glob", "!**/node_modules/**", "--glob", "!**/.git/**"],
+          {
+            cwd: EXECUTION_ROOT,
+            encoding: "utf8",
+            env: childProcessEnv(),
+            maxBuffer: 16 * 1024 * 1024,
+            timeout: 20_000,
+          },
+        );
+        return { ok: true, output: stdout.split("\n").filter(Boolean).slice(0, 100).join("\n") || "(no matches)" };
+      } catch (err) {
+        const e = err as { code?: number; message?: string };
+        if (e.code === 1) return { ok: true, output: "(no matches)" };
+        return { ok: false, error: e.message ?? String(err) };
+      }
+    }
+    case "Grep": {
+      const pattern = String(params.pattern ?? "");
+      if (!pattern) return { ok: false, error: "pattern required" };
+      const rgArgs = ["-n", "--hidden", "--glob", "!**/node_modules/**", "--glob", "!**/.git/**"];
+      if (params.path) rgArgs.push("-g", String(params.path));
+      rgArgs.push(pattern, REPO_ROOT);
+      try {
+        const stdout = execFileSync("rg", rgArgs, {
+          cwd: EXECUTION_ROOT,
+          encoding: "utf8",
+          env: childProcessEnv(),
+          maxBuffer: 16 * 1024 * 1024,
+          timeout: 20_000,
+        });
+        return { ok: true, output: stdout.split("\n").filter(Boolean).slice(0, 50).join("\n") || "(no matches)" };
+      } catch (err) {
+        const e = err as { code?: number; message?: string };
+        if (e.code === 1) return { ok: true, output: "(no matches)" };
+        return { ok: false, error: e.message ?? String(err) };
+      }
+    }
+    case "WebFetch": {
+      const url = String(params.url ?? "");
+      if (!url) return { ok: false, error: "url required" };
+      try {
+        const out = execFileSync(
+          "curl",
+          ["-s", "-L", "--max-time", "30", "-A", "vibe-local-wasm/1.0", url],
+          { encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 35_000 },
+        );
+        return { ok: true, output: stripHtml(out).slice(0, 5000) || "(empty)" };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    }
+    case "WebSearch":
+      return { ok: true, output: runWebSearch(String(params.query ?? "")) };
+    default:
+      return { ok: false, error: `Tool '${name}' is not allowed in this sub-agent` };
+  }
+}
+
+function truncateContent(value: string, limit: number, suffix: string) {
+  return value.length > limit ? `${value.slice(0, limit)}${suffix}` : value;
+}
+
+function runSubAgentLoop(
+  task: Record<string, unknown>,
+  context: RuntimeAgentContext,
+  dispatchTool: (name: string, params: Record<string, unknown>) => { ok: boolean; output?: string; error?: string },
+) {
+  const prompt = String(task.prompt ?? "");
+  if (!prompt) {
+    return "Error: prompt is required";
+  }
+
+  const rawMaxTurns = Number(task.max_turns ?? 10);
+  const maxTurns = Number.isFinite(rawMaxTurns) ? Math.max(1, Math.min(Math.trunc(rawMaxTurns), 20)) : 10;
+  const allowWrites = Boolean(task.allow_writes);
+  const allowedTools = new Set(["Read", "Glob", "Grep", "WebFetch", "WebSearch"]);
+  if (allowWrites) {
+    allowedTools.add("Bash");
+    allowedTools.add("Write");
+    allowedTools.add("Edit");
+  }
+
+  const label = String(task._agent_label ?? "").trim();
+  const labelDisplay = label ? ` [${label}]` : "";
+  const promptPreview = truncateContent(prompt, 80, "...");
+  const startedAt = Date.now();
+  process.stdout.write(`\n  🤖${labelDisplay} Sub-agent working on: ${promptPreview}\n`);
+
+  const messages: Array<Record<string, unknown>> = [
+    {
+      role: "system",
+      content:
+        "You are a sub-agent assistant. Complete the given task using the available tools. " +
+        "Be thorough but concise. When you have enough information, provide a clear final answer. " +
+        "Do NOT ask follow-up questions — just complete the task and respond.\n" +
+        `Working directory: ${EXECUTION_ROOT}\nPlatform: ${process.platform}\n`,
+    },
+    { role: "user", content: prompt },
+  ];
+
+  const tools = Array.from(allowedTools).map((toolName) => SUBAGENT_TOOL_SCHEMAS[toolName as keyof typeof SUBAGENT_TOOL_SCHEMAS]);
+  let lastText = "";
+  let resultText = "";
+
+  for (let turn = 0; turn < maxTurns; turn += 1) {
+    let message: Record<string, any>;
+    try {
+      message = chatCompletionsSync(context, messages, tools);
+    } catch (err) {
+      resultText = `Sub-agent error on turn ${turn + 1}: ${err instanceof Error ? err.message : String(err)}`;
+      break;
+    }
+
+    const text = String(message.content ?? "");
+    const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+    lastText = text;
+
+    if (toolCalls.length === 0) {
+      resultText = text;
+      break;
+    }
+
+    messages.push({
+      role: "assistant",
+      content: text || null,
+      tool_calls: toolCalls,
+    });
+
+    for (const toolCall of toolCalls) {
+      const fn = (toolCall as Record<string, any>).function ?? {};
+      const toolName = String(fn.name ?? "");
+      const toolCallId = String((toolCall as Record<string, any>).id ?? `call_${messages.length}`);
+      let toolArgs: Record<string, unknown> = {};
+      try {
+        toolArgs = typeof fn.arguments === "string" ? JSON.parse(fn.arguments) : (fn.arguments ?? {});
+      } catch {
+        toolArgs = { raw: fn.arguments };
+      }
+
+      let toolOutput: string;
+      if (!allowedTools.has(toolName)) {
+        toolOutput = `Error: tool '${toolName}' is not allowed in this sub-agent`;
+      } else {
+        const toolResult = dispatchTool(toolName, toolArgs);
+        toolOutput = toolResult.ok ? String(toolResult.output ?? "") : `Error: ${toolResult.error ?? "unknown error"}`;
+      }
+
+      messages.push({
+        role: "tool",
+        tool_call_id: toolCallId,
+        name: toolName,
+        content: truncateContent(toolOutput, 10_000, "\n...(truncated)"),
+      });
+    }
+
+    const totalChars = messages.reduce((sum, entry) => sum + String(entry.content ?? "").length, 0);
+    if (totalChars > 80_000) {
+      for (let index = 2; index < messages.length - 4; index += 1) {
+        const entry = messages[index];
+        if (entry?.role === "tool" && typeof entry.content === "string" && entry.content.length > 500) {
+          entry.content = `${entry.content.slice(0, 500)}\n...(truncated by sub-agent context limit)`;
+        }
+      }
+    }
+  }
+
+  if (!resultText) {
+    resultText = `Sub-agent reached max turns (${maxTurns}). Last response: ${truncateContent(lastText, 2000, "...")}`;
+  }
+
+  const elapsedSec = ((Date.now() - startedAt) / 1000).toFixed(1);
+  process.stdout.write(`  🤖${labelDisplay} Sub-agent finished (${elapsedSec}s)\n`);
+  return truncateContent(resultText, 20_000, "\n...(truncated)");
+}
+
+type ParallelWorkerPayload = {
+  kind: "parallel-subagent";
+  task: Record<string, unknown>;
+  context: RuntimeAgentContext;
+  resultPath: string;
+  doneBuffer: SharedArrayBuffer;
+};
+
+function runParallelAgents(
+  tasks: Record<string, unknown>[],
+  context: RuntimeAgentContext,
+) {
+  const limitedTasks = tasks.slice(0, 4);
+  if (limitedTasks.length === 0) {
+    return "Error: at least one task is required";
+  }
+
+  process.stdout.write(`\n  🤖 Launching ${limitedTasks.length} parallel agents...\n`);
+  const currentModulePath = fileURLToPath(import.meta.url);
+  const builtWorkerPath = path.resolve(__dirname, "../dist/pyodide-runtime.js");
+  const workerEntry =
+    currentModulePath.endsWith(".ts") && existsSync(builtWorkerPath)
+      ? { url: pathToFileURL(builtWorkerPath), execArgv: [] as string[] }
+      : { url: new URL(import.meta.url), execArgv: ["--import", "tsx"] };
+
+  const workers = limitedTasks.map((task, index) => {
+    const resultPath = path.join(TMP_ROOT, `vlw-subagent-${process.pid}-${Date.now()}-${index}.json`);
+    const doneBuffer = new SharedArrayBuffer(4);
+    const payload: ParallelWorkerPayload = {
+      kind: "parallel-subagent",
+      task: { ...task, _agent_label: `Agent ${index + 1}/${limitedTasks.length}` },
+      context,
+      resultPath,
+      doneBuffer,
+    };
+    const worker = new Worker(workerEntry.url, {
+      workerData: payload,
+      execArgv: workerEntry.execArgv,
+    });
+    return { worker, resultPath, done: new Int32Array(doneBuffer), task, index };
+  });
+
+  const startedAt = Date.now();
+  let nextHeartbeatAt = startedAt + 10_000;
+  for (const entry of workers) {
+    while (Atomics.load(entry.done, 0) === 0) {
+      const now = Date.now();
+      if (now >= nextHeartbeatAt) {
+        const completed = workers.filter((item) => Atomics.load(item.done, 0) === 1).length;
+        process.stdout.write(`  ⏳ Parallel agents: ${completed}/${workers.length} done, ${Math.round((now - startedAt) / 1000)}s elapsed...\n`);
+        nextHeartbeatAt = now + 10_000;
+      }
+      Atomics.wait(entry.done, 0, 0, 1_000);
+    }
+  }
+
+  const results = workers.map((entry) => {
+    entry.worker.terminate().catch(() => {});
+    try {
+      const raw = readFileSync(entry.resultPath, "utf8");
+      unlinkSync(entry.resultPath);
+      return JSON.parse(raw) as { prompt: string; result: string; duration: number; error: string | null };
+    } catch (err) {
+      return {
+        prompt: String(entry.task.prompt ?? "").slice(0, 100),
+        result: "",
+        duration: 300,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  });
+
+  const succeeded = results.filter((item) => !item.error).length;
+  const failed = results.length - succeeded;
+  const totalTime = Math.max(...results.map((item) => item.duration), 0);
+  const outputParts: string[] = [];
+  results.forEach((result, index) => {
+    const status = result.error ? "FAIL" : "OK";
+    outputParts.push(`┌─── Agent ${index + 1}/${results.length} [${status}] ───`);
+    outputParts.push(`│ Task: ${truncateContent(result.prompt, 80, "...")}`);
+    outputParts.push(`│ Time: ${result.duration.toFixed(1)}s`);
+    if (result.error) {
+      outputParts.push(`│ Error: ${result.error}`);
+    } else {
+      const resultText = truncateContent(result.result, 3000, "\n...(result truncated)");
+      resultText.split("\n").forEach((line) => outputParts.push(`│ ${line}`));
+    }
+    outputParts.push(`└${"─".repeat(40)}`);
+  });
+  let summary = `Summary: ${succeeded}/${results.length} succeeded`;
+  if (failed > 0) {
+    summary += `, ${failed} failed`;
+  }
+  summary += ` (total wall time: ${totalTime.toFixed(1)}s)`;
+  outputParts.push(summary);
+  process.stdout.write(`  🤖 All ${results.length} agents finished (${succeeded} OK, ${failed} failed, ${totalTime.toFixed(1)}s)\n`);
+  return outputParts.join("\n");
+}
+
+if (!isMainThread && workerData && (workerData as ParallelWorkerPayload).kind === "parallel-subagent") {
+  const data = workerData as ParallelWorkerPayload;
+  const done = new Int32Array(data.doneBuffer);
+  try {
+    const start = Date.now();
+    const result = runSubAgentLoop(data.task, data.context, executeSubAgentAllowedTool);
+    writeFileSync(
+      data.resultPath,
+      JSON.stringify({
+        prompt: String(data.task.prompt ?? "").slice(0, 100),
+        result,
+        duration: (Date.now() - start) / 1000,
+        error: null,
+      }),
+      "utf8",
+    );
+  } catch (err) {
+    writeFileSync(
+      data.resultPath,
+      JSON.stringify({
+        prompt: String(data.task.prompt ?? "").slice(0, 100),
+        result: "",
+        duration: 0,
+        error: err instanceof Error ? err.message : String(err),
+      }),
+      "utf8",
+    );
+  } finally {
+    Atomics.store(done, 0, 1);
+    Atomics.notify(done, 0);
+  }
+}
+
 function runRestrictedCommand(argv: string[], cwd: string, timeoutMs: number) {
   if (argv.length === 0) {
     throw new Error("Empty argv");
@@ -1053,6 +1571,45 @@ async function initPyodide() {
               });
             }
           }
+          case "SubAgent": {
+            if (currentAgentContext === null) {
+              return JSON.stringify({
+                ok: false,
+                error: "SubAgent is only available during a full agent turn",
+              });
+            }
+            try {
+              return JSON.stringify({
+                ok: true,
+                output: runSubAgentLoop(params, currentAgentContext, executeSubAgentAllowedTool),
+              });
+            } catch (err) {
+              return JSON.stringify({
+                ok: false,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+          case "ParallelAgents": {
+            if (currentAgentContext === null) {
+              return JSON.stringify({
+                ok: false,
+                error: "ParallelAgents is only available during a full agent turn",
+              });
+            }
+            const tasks = Array.isArray(params.tasks) ? params.tasks.filter((task) => task && typeof task === "object") : [];
+            try {
+              return JSON.stringify({
+                ok: true,
+                output: runParallelAgents(tasks as Record<string, unknown>[], currentAgentContext),
+              });
+            } catch (err) {
+              return JSON.stringify({
+                ok: false,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
           default:
             return JSON.stringify({
               ok: false,
@@ -1304,8 +1861,24 @@ def _make_bridge_execute(tool_name):
         return f"Error ({tool_name}): {result.get('error', 'unknown error')}"
     return _bridge_execute
 
+def _register_bridge_only_tools(registry):
+    """Register tools that need constructor dependencies but are JS-bridged here."""
+    try:
+        if registry.get("SubAgent") is None:
+            registry.register(_mod.SubAgentTool(_mod.Config(), None, registry, None))
+    except Exception:
+        pass
+    try:
+        if registry.get("ParallelAgents") is None:
+            coordinator = _mod.MultiAgentCoordinator(_mod.Config(), None, registry, None)
+            registry.register(_mod.ParallelAgentTool(coordinator))
+    except Exception:
+        pass
+    return registry
+
 def install_tool_bridge(registry):
     """Replace every tool.execute in this registry with a JS-bridged version."""
+    _register_bridge_only_tools(registry)
     for name, tool_instance in list(registry._tools.items()):
         bridged = _make_bridge_execute(name)
         tool_instance.execute = _types.MethodType(bridged, tool_instance)
@@ -1429,6 +2002,8 @@ export type PyodideToolCallResult = {
   error?: string;
 };
 
+export type PyodideToolBridgeContext = RuntimeAgentContext;
+
 /**
  * Execute one of vibe-coder.py's built-in Tool subclasses (Bash, Read, Write,
  * Glob, Grep, etc.) directly inside Pyodide via its native Python execute().
@@ -1518,7 +2093,14 @@ export async function pyodideRunAgentTurn(
       allowed_tools: input.allowedTools ?? null,
     }),
   );
-  const resultJson = py.runPython(`
+  currentAgentContext = {
+    baseUrl: input.baseUrl,
+    model: input.model,
+    maxTokens: input.maxTokens ?? 2048,
+    temperature: input.temperature ?? 0.2,
+  };
+  try {
+    const resultJson = py.runPython(`
 import json, builtins, traceback
 mod = builtins.vibe_coder
 install = builtins.install_tool_bridge
@@ -1626,7 +2208,10 @@ except Exception as e:
     }
 json.dumps(_res, default=str)
 `) as string;
-  return JSON.parse(resultJson) as PyodideAgentTurnResult;
+    return JSON.parse(resultJson) as PyodideAgentTurnResult;
+  } finally {
+    currentAgentContext = null;
+  }
 }
 
 /**
@@ -1669,4 +2254,17 @@ except Exception as e:
 json.dumps(_res)
 `) as string;
   return JSON.parse(resultJson) as PyodideToolCallResult;
+}
+
+export async function pyodideToolCallViaBridgeWithContext(
+  toolName: string,
+  params: Record<string, unknown>,
+  context: PyodideToolBridgeContext,
+): Promise<PyodideToolCallResult> {
+  currentAgentContext = context;
+  try {
+    return await pyodideToolCallViaBridge(toolName, params);
+  } finally {
+    currentAgentContext = null;
+  }
 }
