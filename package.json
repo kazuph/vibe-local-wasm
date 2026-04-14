@@ -8,20 +8,13 @@
   },
   "scripts": {
     "help:standalone": "node ./bin/vibe-local-wasm.mjs help",
-    "dev": "bash tools/agentos-dev/scripts/dev-vibe-local-agentos.sh",
-    "web": "pnpm --filter @vibe-local-wasm/web run dev",
+    "dev": "pnpm --filter @vibe-local-wasm/agentos run dev",
     "agentos": "pnpm --filter @vibe-local-wasm/agentos run dev",
     "start:agentos": "pnpm --filter @vibe-local-wasm/agentos run start",
-    "build": "pnpm --filter @vibe-local-wasm/agentos run build && pnpm --filter @vibe-local-wasm/web run build",
-    "check": "pnpm --filter @vibe-local-wasm/agentos run check && pnpm --filter @vibe-local-wasm/web run check",
+    "build": "pnpm --filter @vibe-local-wasm/agentos run build",
+    "check": "pnpm --filter @vibe-local-wasm/agentos run check",
     "doctor": "pnpm --filter @vibe-local-wasm/agentos run doctor",
     "smoke": "pnpm --filter @vibe-local-wasm/agentos run smoke",
-    "cli": "pnpm --filter @vibe-local-wasm/agentos exec tsx src/vibe-local-cli.ts",
-    "health": "pnpm run cli -- health",
-    "projects": "pnpm run cli -- projects",
-    "open": "open -a \"Google Chrome\" http://localhost:${VIBE_LOCAL_PORT:-5374}/",
-    "dev:vibe-local-agentos": "pnpm run dev",
-    "dev:vibe-local-pyodide": "pnpm run web",
-    "vibe-local:cli": "pnpm run cli --"
+    "cli": "pnpm --filter @vibe-local-wasm/agentos exec tsx src/vibe-local-cli.ts"
   }
 }

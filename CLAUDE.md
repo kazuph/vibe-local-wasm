@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **agentOS**: Rivet-based managed VM runtime for workspace virtualization and tool execution
 - **AgentFS**: Filesystem mirroring/audit layer backed by SQLite
 - **sandbox-agent**: Separate execution plane for coding agents
-- **Pyodide (WASM)**: 本家 `vibe-coder.py` (~8200行) をそのまま WASM 上で実行（`pyodide-chat` コマンドで利用可能）
+- **Pyodide (WASM)**: 本家 `vibe-coder.py` (~8200行) をそのまま WASM 上で実行（CLI `chat` の既定実行経路）
 - **sql.js (WASM)**: In-browser SQLite for session persistence
 
 ## 本家 vibe-local との関係
@@ -36,10 +36,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### 起動方法
 
-デフォルトは TypeScript の `runAgentLoop` パスだが、`VIBE_LOCAL_PYODIDE=1` を設定すると Pyodide 経由 (vibe-coder.py) になる:
+CLI `chat` は Pyodide 経由 (vibe-coder.py) で動く:
 
 ```bash
-VIBE_LOCAL_PYODIDE=1 pnpm run cli -- chat vibe-local-pyodide --mode yolo
+pnpm run cli -- chat vibe-local-pyodide --mode yolo
 ```
 
 ### 実行経路
@@ -49,7 +49,7 @@ CLI → actor.runAgentTurn(prompt)
         ↓
      persistMessage(user)                     [actor DB]
         ↓
-     [VIBE_LOCAL_PYODIDE=1] executePyodideAgentTurn
+     executePyodideAgentTurn
         ↓
      pyodideRunAgentTurn(messages, settings)  [pyodide-runtime.ts]
         ↓
@@ -101,7 +101,6 @@ Two pnpm workspace packages:
 | Package | Path | Description |
 |---------|------|-------------|
 | `@vibe-local-wasm/agentos` | `tools/agentos-dev/` | Actor runtime, CLI, agentOS registry, sandbox wiring, AgentFS |
-| `@vibe-local-wasm/web` | `vibe-local-pyodide/` | React + Vite web client |
 
 Root `bin/vibe-local-wasm.mjs` is the standalone CLI entrypoint.
 
@@ -111,17 +110,16 @@ Root `bin/vibe-local-wasm.mjs` is the standalone CLI entrypoint.
 # Install
 pnpm install
 
-# Development (starts both agentOS manager on :6520 and Vite on :5374)
+# Development
 pnpm run dev
 
-# Individual servers
+# Individual server
 pnpm run agentos          # agentOS manager only (dev mode with watch)
-pnpm run web              # Vite dev server only
 
-# Type check both packages
+# Type check CLI/runtime package
 pnpm run check
 
-# Build both packages
+# Build CLI/runtime package
 pnpm run build
 
 # Diagnostics and self-check
@@ -132,12 +130,8 @@ pnpm run smoke
 pnpm run cli -- <command>
 vibe-local-wasm cli <command>    # after pnpm link --global
 
-# Health and project listing
-pnpm run health
-pnpm run projects
-
-# E2E tests (requires dev servers running)
-cd vibe-local-pyodide && pnpm run test:e2e
+# CLI
+pnpm run cli -- chat vibe-local-pyodide --mode act
 ```
 
 ## Architecture (3-Layer)
@@ -157,7 +151,7 @@ Browser/CLI → Vite Middleware (/__vibe_local/*) → RivetKit Client → agentO
 
 All browser-to-backend communication goes through Vite middleware defined in `vibe-local-pyodide/vite.config.ts`. Key route prefixes:
 
-- `/__vibe_local/agentos/*` → actor session management (create, config, message, compact, agent-run, approval, sub-agents, export, hydrate, health)
+- `/__vibe_local/agentos/*` → actor session management (create, config, message, compact, run-agent, export, hydrate, health)
 - `/__vibe_local/coding/*` → file ops, git, search, project listing, script execution
 - `/__vibe_local/chat` → OpenAI-compatible streaming proxy
 - `/__vibe_local/models` → model list proxy
@@ -193,7 +187,7 @@ The middleware calls `vibeLocal` actor via `rivetkit` client at `AGENTOS_ENDPOIN
 | File | Role |
 |------|------|
 | `tools/agentos-dev/src/vibe-local-actor.ts` | Main actor: all session/message/approval/sub-agent logic |
-| `tools/agentos-dev/src/vibe-local-cli.ts` | CLI commands: chat, health, projects, agent-run, etc. |
+| `tools/agentos-dev/src/vibe-local-cli.ts` | CLI commands: chat and the core interactive slash commands |
 | `tools/agentos-dev/src/registry.ts` | agentOS manager setup (workspaceVm + codingSandbox) |
 | `tools/agentos-dev/src/agentfs.ts` | AgentFS integration |
 | `tools/agentos-dev/src/toolkits.ts` | Host toolkits (repo, git, code search) |

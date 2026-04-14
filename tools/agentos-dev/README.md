@@ -19,21 +19,8 @@
 ## 使い方
 
 ```bash
-pnpm doctor:agentos
-pnpm dev:agentos
-pnpm dev:vibe-local-agentos
-```
-
-別ターミナルで self-check:
-
-```bash
-pnpm smoke:agentos
-```
-
-project 一覧:
-
-```bash
-pnpm agentos:list-projects
+pnpm run doctor
+pnpm run dev
 ```
 
 project を開く:
@@ -44,21 +31,15 @@ pnpm agentos:open -- --project vibe-local-pyodide --surface workspace
 pnpm agentos:open -- --project vibe-local-pyodide --surface sandbox --agent codex
 ```
 
-`vibe-local-pyodide` を `agentOS` 付きで使う:
+`vibe-local-pyodide` を対象 project として CLI から使う:
 
 ```bash
-pnpm dev:vibe-local-agentos
-pnpm vibe-local:cli health
-pnpm vibe-local:cli projects
-pnpm vibe-local:cli search "agentOS actor"
-pnpm vibe-local:cli run-script vibe-local-pyodide check
-pnpm vibe-local:cli agent-run vibe-local-pyodide "git status を見て要約して"
-pnpm vibe-local:cli read-file README.md
-printf 'hello from cli\n' | pnpm vibe-local:cli write-file tools/agentos-dev/.agentos-dev/workspace/note.txt
-pnpm vibe-local:cli read-agentfs-mirror tools/agentos-dev/.agentos-dev/workspace/note.txt
+pnpm run dev
+pnpm run cli -- chat vibe-local-pyodide --mode act
+pnpm run cli -- chat vibe-local-pyodide --mode plan
 ```
 
-この状態で `http://localhost:5374/` を開くと、Status が `agentOS actor` になり、会話・セッション一覧・compact artifact が `vibeLocal` actor の SQLite に保存されます。browser からは project 選択、repo search、file open / save、git status / diff stat、script 実行に加えて、選択中 project を優先した tool-calling agent run ができます。CLI からは同じ `vibeLocal` actor を直接叩きます。
+CLI からは同じ `vibeLocal` actor を直接叩き、会話・compact artifact・task state が actor-local SQLite に保存されます。
 
 ## vibe-local parity の優先順位
 
