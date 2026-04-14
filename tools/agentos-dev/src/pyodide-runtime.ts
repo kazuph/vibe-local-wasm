@@ -266,6 +266,72 @@ function stripHtml(text: string) {
     .trim();
 }
 
+function normalizeCharsetLabel(label: string | null | undefined) {
+  if (!label) return "utf-8";
+  const normalized = label.trim().toLowerCase();
+  switch (normalized) {
+    case "shift-jis":
+    case "shift_jis":
+    case "sjis":
+    case "ms932":
+    case "windows-31j":
+    case "cp932":
+      return "shift_jis";
+    case "euc-jp":
+    case "euc_jp":
+      return "euc-jp";
+    case "utf8":
+      return "utf-8";
+    default:
+      return normalized;
+  }
+}
+
+function detectHtmlCharset(buffer: Buffer) {
+  const probe = buffer.subarray(0, Math.min(buffer.length, 4096)).toString("latin1");
+  const metaCharset =
+    probe.match(/<meta[^>]+charset=["']?\s*([A-Za-z0-9._-]+)/i)?.[1] ??
+    probe.match(/content=["'][^"']*charset=\s*([A-Za-z0-9._-]+)/i)?.[1] ??
+    probe.match(/<\?xml[^>]+encoding=["']\s*([A-Za-z0-9._-]+)/i)?.[1] ??
+    null;
+  return normalizeCharsetLabel(metaCharset);
+}
+
+function decodeHtmlResponse(buffer: Buffer) {
+  const charset = detectHtmlCharset(buffer);
+  try {
+    return new TextDecoder(charset).decode(buffer);
+  } catch {
+    return new TextDecoder("utf-8").decode(buffer);
+  }
+}
+
+function extractHtmlMetadata(html: string) {
+  const title = stripHtml(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] ?? "");
+  const heading = stripHtml(html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)?.[1] ?? "");
+  const subheading = stripHtml(html.match(/<h2[^>]*>([\s\S]*?)<\/h2>/i)?.[1] ?? "");
+  return { title, heading, subheading };
+}
+
+function fetchWebText(url: string) {
+  const out = execFileSync(
+    "curl",
+    ["-s", "-L", "--max-time", "30", "-A", "vibe-local-wasm/1.0", url],
+    { encoding: "buffer", maxBuffer: 8 * 1024 * 1024, timeout: 35_000 },
+  ) as Buffer;
+  const html = decodeHtmlResponse(out);
+  const meta = extractHtmlMetadata(html);
+  const body = stripHtml(html);
+  const prefix = [
+    meta.title ? `Title: ${meta.title}` : "",
+    meta.heading ? `Heading: ${meta.heading}` : "",
+    meta.subheading ? `Subheading: ${meta.subheading}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return [prefix, body].filter(Boolean).join("\n\n").slice(0, 5000) || "(empty)";
+}
+
 function decodeDuckDuckGoUrl(rawUrl: string) {
   if (!rawUrl) return "";
   try {
@@ -954,12 +1020,7 @@ function executeSubAgentAllowedTool(name: string, params: Record<string, unknown
       const url = String(params.url ?? "");
       if (!url) return { ok: false, error: "url required" };
       try {
-        const out = execFileSync(
-          "curl",
-          ["-s", "-L", "--max-time", "30", "-A", "vibe-local-wasm/1.0", url],
-          { encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 35_000 },
-        );
-        return { ok: true, output: stripHtml(out).slice(0, 5000) || "(empty)" };
+        return { ok: true, output: fetchWebText(url) };
       } catch (err) {
         return { ok: false, error: err instanceof Error ? err.message : String(err) };
       }
@@ -1500,20 +1561,14 @@ async function initPyodide() {
             const url = String(params.url ?? "");
             if (!url) return JSON.stringify({ ok: false, error: "url required" });
             try {
-              const out = execFileSync(
-                "curl",
-                ["-s", "-L", "--max-time", "30", "-A", "vibe-local-wasm/1.0", url],
-                { encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 35_000 },
-              );
-               const text = stripHtml(out).slice(0, 5000);
-               return JSON.stringify({ ok: true, output: text || "(empty)" });
-             } catch (err) {
-               return JSON.stringify({
-                 ok: false,
-                 error: err instanceof Error ? err.message : String(err),
-               });
-             }
-           }
+              return JSON.stringify({ ok: true, output: fetchWebText(url) });
+            } catch (err) {
+              return JSON.stringify({
+                ok: false,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
           case "WebSearch": {
             const query = String(params.query ?? "");
             return JSON.stringify({ ok: true, output: runWebSearch(query) });
