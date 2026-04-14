@@ -1,13 +1,14 @@
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline/promises";
 
 import { createClient } from "rivetkit/client";
 
-import { AGENTOS_PORT } from "./config.js";
+import { AGENTOS_PORT, REPO_ROOT } from "./config.js";
 import { registry } from "./registry.js";
+import { runGit } from "./shared/git-utils.js";
 import {
   FixedFooter,
   bold,
@@ -34,6 +35,13 @@ type OpenCodeConfig = {
   >;
 };
 
+type AvailableModel = {
+  baseUrl: string;
+  displayName: string;
+  modelId: string;
+  providerId: string;
+};
+
 type BackendSettings = {
   apiKey: string;
   baseUrl: string;
@@ -42,6 +50,16 @@ type BackendSettings = {
   model: string;
   systemPrompt: string;
   temperature: number;
+};
+
+type LoadedBackendConfig = {
+  configPath: string;
+  providers: Array<{
+    baseUrl: string;
+    id: string;
+    models: AvailableModel[];
+  }>;
+  settings: BackendSettings;
 };
 
 type SessionSnapshot = Awaited<ReturnType<Awaited<ReturnType<typeof getActor>>["exportSession"]>>;
@@ -209,37 +227,45 @@ async function getActor() {
   return client.vibeLocal.getOrCreate(["browser-core"]);
 }
 
-function loadBackendSettings(): BackendSettings {
+function loadBackendConfig(): LoadedBackendConfig {
   const configPath = path.join(homedir(), ".config", "opencode", "config.json");
   if (!existsSync(configPath)) {
     throw new Error(`OpenCode config not found at ${configPath}`);
   }
 
   const payload = JSON.parse(readFileSync(configPath, "utf8")) as OpenCodeConfig;
-  const providerEntries = Object.entries(payload.provider ?? {});
+  const providers = Object.entries(payload.provider ?? {}).map(([providerId, providerConfig]) => ({
+    baseUrl: providerConfig.options?.baseURL ?? "",
+    id: providerId,
+    models: Object.entries(providerConfig.models ?? {}).map(([modelId, modelConfig]) => ({
+      baseUrl: providerConfig.options?.baseURL ?? "",
+      displayName: modelConfig.name ?? modelId,
+      modelId,
+      providerId,
+    })),
+  }));
   const preferred =
-    providerEntries.find(([key]) => key === "qwen-local") ??
-    providerEntries.find(([, value]) => Object.keys(value.models ?? {}).length > 0) ??
+    providers.find((provider) => provider.id === "qwen-local" && provider.models.length > 0) ??
+    providers.find((provider) => provider.models.length > 0) ??
     null;
 
   if (!preferred) {
     throw new Error("No OpenCode provider with models found.");
   }
 
-  const [, providerConfig] = preferred;
-  const firstModelEntry = Object.entries(providerConfig.models ?? {})[0];
-  if (!firstModelEntry) {
-    throw new Error("Selected OpenCode provider has no models.");
-  }
-
   return {
-    apiKey: providerConfig.options?.apiKey ?? "",
-    baseUrl: providerConfig.options?.baseURL ?? "",
-    contextWindow: 4096,
-    model: firstModelEntry[0],
-    maxTokens: 4096,
-    systemPrompt: "You are a helpful coding assistant. Be concise.",
-    temperature: 0.2,
+    configPath,
+    providers,
+    settings: {
+      apiKey:
+        payload.provider?.[preferred.id]?.options?.apiKey ?? "",
+      baseUrl: preferred.baseUrl,
+      contextWindow: 4096,
+      model: preferred.models[0]?.modelId ?? "",
+      maxTokens: 4096,
+      systemPrompt: "You are a helpful coding assistant. Be concise.",
+      temperature: 0.2,
+    },
   };
 }
 
@@ -388,6 +414,195 @@ function applyFlagOverrides(settings: BackendSettings, options: ChatCliOptions):
     model: options.model ?? settings.model,
     temperature: options.temperature ?? settings.temperature,
   };
+}
+
+function stripReasoningTags(value: string) {
+  return value.replace(/<think>[\s\S]*?<\/think>\s*/g, "").trim();
+}
+
+function estimateTokens(text: string) {
+  return Math.ceil(text.length / 4);
+}
+
+function estimateSessionTokens(snapshot: NonNullable<SessionSnapshot>) {
+  const messageTokens = snapshot.messages.reduce(
+    (sum: number, message: NonNullable<SessionSnapshot>["messages"][number]) =>
+      sum + estimateTokens(message.content),
+    0,
+  );
+  const artifactTokens = snapshot.artifacts.reduce((sum: number, artifact: NonNullable<SessionSnapshot>["artifacts"][number]) => {
+    if (artifact.kind !== "compaction_summary") {
+      return sum;
+    }
+    const summary = typeof artifact.payload.summary === "string" ? artifact.payload.summary : "";
+    return sum + estimateTokens(summary);
+  }, 0);
+  const taskTokens = snapshot.task?.lastResponse ? estimateTokens(snapshot.task.lastResponse) : 0;
+  return messageTokens + artifactTokens + taskTokens;
+}
+
+function buildUsageBar(used: number, total: number) {
+  const width = 30;
+  const pct = total > 0 ? Math.min(Math.round((used / total) * 100), 100) : 0;
+  const filled = Math.round((pct / 100) * width);
+  return {
+    bar: `${"█".repeat(filled)}${"░".repeat(width - filled)}`,
+    pct,
+  };
+}
+
+function splitShellWords(inputText: string) {
+  const args: string[] = [];
+  let current = "";
+  let quote: "'" | "\"" | null = null;
+  let escaped = false;
+
+  for (const char of inputText) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+    if (char === "'" || char === "\"") {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) {
+        args.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += char;
+  }
+
+  if (escaped || quote) {
+    throw new Error("Unterminated quoted argument.");
+  }
+  if (current) {
+    args.push(current);
+  }
+  return args;
+}
+
+function isDangerousGitArg(arg: string) {
+  const normalized = arg.toLowerCase();
+  const exact = new Set(["-c"]);
+  const prefixes = [
+    "--exec-path",
+    "--upload-pack",
+    "--receive-pack",
+    "--config",
+    "--config-env",
+    "--git-dir",
+    "--work-tree",
+    "-c=",
+  ];
+  return exact.has(normalized) || prefixes.some((prefix) => normalized.startsWith(prefix));
+}
+
+function listSkillFiles(baseDir: string) {
+  if (!existsSync(baseDir)) {
+    return [] as Array<{ lines: number; name: string; path: string }>;
+  }
+
+  const entries = readdirSync(baseDir, { withFileTypes: true });
+  const results: Array<{ lines: number; name: string; path: string }> = [];
+  for (const entry of entries) {
+    if (entry.isFile() && entry.name.endsWith(".md")) {
+      const fullPath = path.join(baseDir, entry.name);
+      const lines = readFileSync(fullPath, "utf8").split("\n").length;
+      results.push({ lines, name: entry.name.replace(/\.md$/, ""), path: fullPath });
+      continue;
+    }
+    if (entry.isDirectory()) {
+      const skillPath = path.join(baseDir, entry.name, "SKILL.md");
+      if (existsSync(skillPath) && statSync(skillPath).isFile()) {
+        const lines = readFileSync(skillPath, "utf8").split("\n").length;
+        results.push({ lines, name: entry.name, path: skillPath });
+      }
+    }
+  }
+  return results;
+}
+
+async function generateCommitMessage(settings: BackendSettings, diffText: string) {
+  const endpoint = `${settings.baseUrl.replace(/\/$/, "")}/chat/completions`;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(settings.apiKey ? { Authorization: `Bearer ${settings.apiKey}` } : {}),
+    },
+    body: JSON.stringify({
+      max_tokens: Math.min(settings.maxTokens, 400),
+      messages: [
+        {
+          content:
+            "You are a commit message generator. Given a git diff, write a concise conventional commit message. Use format: <type>: <description>. Keep the first line under 72 characters. Add a blank line and bullet points only if needed. Output only the commit message.",
+          role: "system",
+        },
+        {
+          content: `Generate a commit message for this diff:\n\n${diffText}`,
+          role: "user",
+        },
+      ],
+      model: settings.model,
+      stream: false,
+      temperature: Math.min(settings.temperature, 0.3),
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`commit message generation failed: ${response.status} ${response.statusText}`);
+  }
+
+  const payload = (await response.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const message = stripReasoningTags(payload.choices?.[0]?.message?.content ?? "");
+  if (!message) {
+    throw new Error("commit message generation returned an empty response.");
+  }
+  return message;
+}
+
+async function promptForCommitMessageOverride(
+  rl: ReturnType<typeof createInterface>,
+  proposedMessage: string,
+) {
+  const answer = (await rl.question(cyan("Commit with this message? [Y/n/e(dit)] "))).trim().toLowerCase();
+  if (answer === "n" || answer === "no") {
+    return null;
+  }
+  if (answer !== "e" && answer !== "edit") {
+    return proposedMessage;
+  }
+
+  console.log(dim("Enter a replacement commit message. Submit an empty line to finish."));
+  const lines: string[] = [];
+  while (true) {
+    const nextLine = await rl.question("");
+    if (!nextLine) {
+      break;
+    }
+    lines.push(nextLine);
+  }
+  const replacement = lines.join("\n").trim();
+  return replacement || null;
 }
 
 function resolveMode(options: ChatCliOptions, snapshot?: NonNullable<SessionSnapshot>): SessionMode {
@@ -562,9 +777,13 @@ async function runInteractiveChat(
   project: string,
   initialMode: SessionMode,
   settings: BackendSettings,
+  backendConfig: LoadedBackendConfig,
 ) {
   let mode = initialMode;
   let currentProject = project;
+  let checkpointRef: string | null = null;
+  let autoTestEnabled = false;
+  let watchEnabled = false;
 
   const footer = new FixedFooter({
     model: settings.model,
@@ -603,11 +822,26 @@ async function runInteractiveChat(
         console.log(`  ${cyan("/help")}          Show this help`);
         console.log(`  ${cyan("/exit")}          Exit session`);
         console.log(`  ${cyan("/clear")}         Clear conversation`);
+        console.log(`  ${cyan("/save")}          Export the current session snapshot`);
         console.log(`  ${cyan("/plan")}          Enter Plan mode (read-only)`);
         console.log(`  ${cyan("/approve")}       Switch to Act mode`);
+        console.log(`  ${cyan("/yes")}           Enable YOLO/auto-approve mode`);
+        console.log(`  ${cyan("/no")}            Return to Act mode from YOLO`);
         console.log(`  ${cyan("/status")}        Show session info`);
+        console.log(`  ${cyan("/tokens")}        Show estimated context usage`);
+        console.log(`  ${cyan("/config")}        Show current CLI settings`);
         console.log(`  ${cyan("/compact")}       Compress conversation history`);
         console.log(`  ${cyan("/model")} ${gray("<name>")}  Switch model`);
+        console.log(`  ${cyan("/models")}         List configured models`);
+        console.log(`  ${cyan("/diff")}          Show git diff`);
+        console.log(`  ${cyan("/git")} ${gray("<args>")}   Run a git command`);
+        console.log(`  ${cyan("/commit")}        Draft a commit message and optionally commit`);
+        console.log(`  ${cyan("/checkpoint")}    Save a tracked-files git checkpoint`);
+        console.log(`  ${cyan("/rollback")}      Restore the last checkpoint`);
+        console.log(`  ${cyan("/autotest")}      Toggle post-edit autotest placeholder`);
+        console.log(`  ${cyan("/watch")}         Toggle file-watch placeholder`);
+        console.log(`  ${cyan("/skills")}        List available skill files`);
+        console.log(`  ${cyan("/init")}          Create a CLAUDE.md template if missing`);
         continue;
       }
 
@@ -625,11 +859,45 @@ async function runInteractiveChat(
         console.log(`  ${gray("session")}  ${sessionId.slice(0, 8)}`);
         console.log(`  ${gray("model")}    ${cyan(settings.model)}`);
         console.log(`  ${gray("mode")}     ${mode}`);
+        console.log(`  ${gray("approve")}  ${mode === "yolo" ? "auto" : "prompted"}`);
         console.log(`  ${gray("project")}  ${currentProject}`);
         console.log(`  ${gray("messages")} ${msgCount}`);
+        console.log(`  ${gray("watch")}    ${watchEnabled ? "on" : "off"}`);
+        console.log(`  ${gray("autotest")} ${autoTestEnabled ? "on" : "off"}`);
         if (snapshot?.task?.status) {
           console.log(`  ${gray("task")}     ${snapshot.task.status}`);
         }
+        continue;
+      }
+
+      if (line === "/tokens") {
+        const snapshot = (await actor.exportSession(sessionId)) as SessionSnapshot | null;
+        if (!snapshot) {
+          console.log(yellow("session snapshot unavailable"));
+          continue;
+        }
+        const used = estimateSessionTokens(snapshot);
+        const { bar, pct } = buildUsageBar(used, settings.contextWindow);
+        console.log(bold("Token Usage (estimated):"));
+        console.log(`  [${bar}] ${pct}%`);
+        console.log(`  ${used.toLocaleString()} / ${settings.contextWindow.toLocaleString()} tokens`);
+        console.log(`  ${snapshot.messages.length} messages in session`);
+        if (pct >= 80) {
+          console.log(yellow("Context is getting full. Use /compact if needed."));
+        }
+        continue;
+      }
+
+      if (line === "/config") {
+        console.log(bold("Configuration:"));
+        console.log(`  ${gray("model")}         ${settings.model}`);
+        console.log(`  ${gray("host")}          ${settings.baseUrl}`);
+        console.log(`  ${gray("temperature")}   ${settings.temperature}`);
+        console.log(`  ${gray("max tokens")}    ${settings.maxTokens}`);
+        console.log(`  ${gray("context")}       ${settings.contextWindow}`);
+        console.log(`  ${gray("auto-approve")}  ${mode === "yolo" ? "ON" : "OFF"}`);
+        console.log(`  ${gray("debug")}         ${process.env.AGENTOS_DEBUG ? "ON" : "OFF"}`);
+        console.log(`  ${gray("config path")}   ${backendConfig.configPath}`);
         continue;
       }
 
@@ -656,6 +924,35 @@ async function runInteractiveChat(
         continue;
       }
 
+      if (line === "/models") {
+        console.log(bold("Configured models:"));
+        for (const provider of backendConfig.providers) {
+          console.log(`  ${cyan(provider.id)}${provider.baseUrl ? gray(`  ${provider.baseUrl}`) : ""}`);
+          for (const model of provider.models) {
+            const marker = model.modelId === settings.model ? "*" : "-";
+            const label = model.displayName === model.modelId
+              ? model.modelId
+              : `${model.modelId} (${model.displayName})`;
+            console.log(`    ${marker} ${label}`);
+          }
+        }
+        continue;
+      }
+
+      if (line === "/save") {
+        const snapshot = (await actor.exportSession(sessionId)) as SessionSnapshot | null;
+        if (!snapshot) {
+          console.log(yellow("session snapshot unavailable"));
+          continue;
+        }
+        const targetDir = path.join(REPO_ROOT, ".vibe-local", "sessions");
+        mkdirSync(targetDir, { recursive: true });
+        const targetPath = path.join(targetDir, `${sessionId}.json`);
+        writeFileSync(targetPath, JSON.stringify(snapshot, null, 2));
+        console.log(infoColor(`session exported → ${targetPath}`));
+        continue;
+      }
+
       if (line === "/plan") {
         mode = "plan";
         await actor.setSessionConfig(sessionId, settings.model, mode);
@@ -669,6 +966,265 @@ async function runInteractiveChat(
         await actor.setSessionConfig(sessionId, settings.model, mode);
         footer.update({ mode });
         console.log(infoColor(`mode → ${mode}`));
+        continue;
+      }
+
+      if (line === "/yes") {
+        mode = "yolo";
+        await actor.setSessionConfig(sessionId, settings.model, mode);
+        footer.update({ mode });
+        console.log(infoColor("auto-approve enabled"));
+        continue;
+      }
+
+      if (line === "/no") {
+        mode = "act";
+        await actor.setSessionConfig(sessionId, settings.model, mode);
+        footer.update({ mode });
+        console.log(infoColor("auto-approve disabled"));
+        continue;
+      }
+
+      if (line === "/diff") {
+        const unstaged = await runGit(["diff", "--color=always"]);
+        if (!unstaged.ok) {
+          console.log(errorColor(unstaged.stderr.trim() || "git diff failed"));
+          continue;
+        }
+        if (unstaged.stdout.trim()) {
+          process.stdout.write(unstaged.stdout.endsWith("\n") ? unstaged.stdout : `${unstaged.stdout}\n`);
+          continue;
+        }
+        const staged = await runGit(["diff", "--cached", "--color=always"]);
+        if (!staged.ok) {
+          console.log(errorColor(staged.stderr.trim() || "git diff --cached failed"));
+          continue;
+        }
+        if (staged.stdout.trim()) {
+          console.log(dim("(staged changes)"));
+          process.stdout.write(staged.stdout.endsWith("\n") ? staged.stdout : `${staged.stdout}\n`);
+        } else {
+          console.log(infoColor("No changes."));
+        }
+        continue;
+      }
+
+      if (line.startsWith("/git")) {
+        const rawArgs = line.slice("/git".length).trim();
+        if (!rawArgs) {
+          console.log(yellow("Usage: /git <command>"));
+          continue;
+        }
+        try {
+          const gitArgs = splitShellWords(rawArgs);
+          if (gitArgs.some(isDangerousGitArg)) {
+            console.log(errorColor("Blocked: /git does not allow -c, --config, or exec-path options."));
+            continue;
+          }
+          const result = await runGit(gitArgs);
+          if (result.stdout) {
+            process.stdout.write(result.stdout.endsWith("\n") ? result.stdout : `${result.stdout}\n`);
+          }
+          if (result.stderr) {
+            process.stdout.write(yellow(result.stderr.endsWith("\n") ? result.stderr : `${result.stderr}\n`));
+          }
+          if (!result.ok && !result.stderr && !result.stdout) {
+            console.log(errorColor("git command failed"));
+          }
+        } catch (err) {
+          console.log(errorColor(`git error: ${err instanceof Error ? err.message : String(err)}`));
+        }
+        continue;
+      }
+
+      if (line === "/commit") {
+        const status = await runGit(["status", "--porcelain"]);
+        if (!status.ok) {
+          console.log(errorColor(status.stderr.trim() || "Not a git repository."));
+          continue;
+        }
+        let staged = await runGit(["diff", "--cached", "--stat"]);
+        if (!staged.ok) {
+          console.log(errorColor(staged.stderr.trim() || "git diff --cached failed"));
+          continue;
+        }
+
+        if (!staged.stdout.trim()) {
+          if (!status.stdout.trim()) {
+            console.log(infoColor("Nothing to commit, working tree clean."));
+            continue;
+          }
+          let shouldStage = mode === "yolo";
+          if (!shouldStage) {
+            console.log(yellow("Nothing staged. Stage tracked file changes with git add -u?"));
+            console.log(dim(status.stdout.trim()));
+            const answer = (await rl.question(cyan("[y/N] "))).trim().toLowerCase();
+            shouldStage = answer === "y" || answer === "yes";
+          }
+          if (!shouldStage) {
+            console.log(yellow("Commit aborted."));
+            continue;
+          }
+          const addResult = await runGit(["add", "-u"]);
+          if (!addResult.ok) {
+            console.log(errorColor(addResult.stderr.trim() || "git add -u failed"));
+            continue;
+          }
+          staged = await runGit(["diff", "--cached", "--stat"]);
+          if (!staged.ok || !staged.stdout.trim()) {
+            console.log(yellow("No staged diff to commit."));
+            continue;
+          }
+        }
+
+        const diff = await runGit(["diff", "--cached"]);
+        if (!diff.ok || !diff.stdout.trim()) {
+          console.log(yellow("No diff to commit."));
+          continue;
+        }
+
+        try {
+          const proposed = await generateCommitMessage(settings, diff.stdout.slice(0, 4000));
+          console.log(`\n${bold("Proposed commit message:")}\n${proposed}\n`);
+          const finalMessage = mode === "yolo"
+            ? proposed
+            : await promptForCommitMessageOverride(rl, proposed);
+          if (!finalMessage) {
+            console.log(yellow("Commit aborted."));
+            continue;
+          }
+          const tempPath = path.join(tmpdir(), `vibe-local-commit-${process.pid}-${Date.now()}.txt`);
+          writeFileSync(tempPath, finalMessage);
+          try {
+            const commitResult = await runGit(["commit", "-F", tempPath]);
+            if (commitResult.ok) {
+              process.stdout.write(
+                commitResult.stdout.endsWith("\n") ? commitResult.stdout : `${commitResult.stdout}\n`,
+              );
+            } else {
+              console.log(errorColor("Commit failed:"));
+              if (commitResult.stderr) {
+                process.stdout.write(
+                  commitResult.stderr.endsWith("\n") ? commitResult.stderr : `${commitResult.stderr}\n`,
+                );
+              }
+            }
+          } finally {
+            unlinkSync(tempPath);
+          }
+        } catch (err) {
+          console.log(errorColor(`commit error: ${err instanceof Error ? err.message : String(err)}`));
+        }
+        continue;
+      }
+
+      if (line === "/checkpoint") {
+        const checkpoint = await runGit(["stash", "create", `cli-checkpoint-${sessionId.slice(0, 8)}`]);
+        if (!checkpoint.ok) {
+          console.log(errorColor(checkpoint.stderr.trim() || "checkpoint failed"));
+          continue;
+        }
+        const nextRef = checkpoint.stdout.trim();
+        if (!nextRef) {
+          console.log(yellow("No tracked changes to checkpoint."));
+          continue;
+        }
+        checkpointRef = nextRef;
+        console.log(infoColor(`checkpoint saved → ${checkpointRef.slice(0, 12)}`));
+        console.log(dim("Tracked file changes only. Use /rollback to restore this checkpoint."));
+        continue;
+      }
+
+      if (line === "/rollback") {
+        if (!checkpointRef) {
+          console.log(yellow("No checkpoint available."));
+          continue;
+        }
+        let confirmed = mode === "yolo";
+        if (!confirmed) {
+          const answer = (await rl.question(cyan("Rollback tracked files to the last checkpoint? [y/N] ")))
+            .trim()
+            .toLowerCase();
+          confirmed = answer === "y" || answer === "yes";
+        }
+        if (!confirmed) {
+          console.log(yellow("Rollback aborted."));
+          continue;
+        }
+        const reset = await runGit(["reset", "--hard", "HEAD"]);
+        if (!reset.ok) {
+          console.log(errorColor(reset.stderr.trim() || "git reset failed"));
+          continue;
+        }
+        const clean = await runGit(["clean", "-fd"]);
+        if (!clean.ok) {
+          console.log(errorColor(clean.stderr.trim() || "git clean failed"));
+          continue;
+        }
+        const apply = await runGit(["stash", "apply", "--index", checkpointRef]);
+        if (!apply.ok) {
+          console.log(errorColor(apply.stderr.trim() || "rollback failed"));
+          continue;
+        }
+        checkpointRef = null;
+        process.stdout.write(apply.stdout.endsWith("\n") ? apply.stdout : `${apply.stdout}\n`);
+        console.log(infoColor("rolled back to checkpoint"));
+        continue;
+      }
+
+      if (line === "/autotest") {
+        autoTestEnabled = !autoTestEnabled;
+        console.log(`Auto-test: ${autoTestEnabled ? infoColor("ON") : errorColor("OFF")}`);
+        console.log(dim("Phase 3 placeholder: command surface is wired; automatic test hooks land later."));
+        continue;
+      }
+
+      if (line === "/watch") {
+        watchEnabled = !watchEnabled;
+        console.log(`File watcher: ${watchEnabled ? infoColor("ON") : errorColor("OFF")}`);
+        console.log(dim("Phase 3 placeholder: external file change monitoring is not wired into the actor loop yet."));
+        continue;
+      }
+
+      if (line === "/skills") {
+        const skillFiles = [
+          ...listSkillFiles(path.join(homedir(), ".config", "vibe-local", "skills")),
+          ...listSkillFiles(path.join(REPO_ROOT, ".vibe-local", "skills")),
+        ].sort((left, right) => left.name.localeCompare(right.name));
+        if (skillFiles.length === 0) {
+          console.log(yellow("No skills loaded."));
+          continue;
+        }
+        console.log(bold("Loaded skills:"));
+        for (const skillFile of skillFiles) {
+          console.log(`  ${cyan(skillFile.name)} ${gray(`(${skillFile.lines} lines)`)}`);
+        }
+        continue;
+      }
+
+      if (line === "/init") {
+        const claudeMdPath = path.join(REPO_ROOT, "CLAUDE.md");
+        if (existsSync(claudeMdPath)) {
+          console.log(yellow("CLAUDE.md already exists in this directory."));
+          continue;
+        }
+        const projectName = path.basename(REPO_ROOT);
+        const content = [
+          `# ${projectName}`,
+          "",
+          "## Project Overview",
+          "",
+          "<!-- Describe the project here -->",
+          "",
+          "## Instructions for AI",
+          "",
+          "- Follow existing code style",
+          "- Write tests for new features",
+          "- Use absolute paths",
+          "",
+        ].join("\n");
+        writeFileSync(claudeMdPath, content);
+        console.log(infoColor(`Created ${claudeMdPath}`));
         continue;
       }
 
@@ -732,7 +1288,8 @@ async function main() {
         return;
       }
 
-      const settings = applyFlagOverrides(loadBackendSettings(), options);
+      const backendConfig = loadBackendConfig();
+      const settings = applyFlagOverrides(backendConfig.settings, options);
       const resolved = await resolveChatSession(actor, options, settings);
 
       if (options.debug) {
@@ -745,7 +1302,14 @@ async function main() {
         return;
       }
 
-      await runInteractiveChat(actor, resolved.sessionId, resolved.project, resolved.mode, settings);
+      await runInteractiveChat(
+        actor,
+        resolved.sessionId,
+        resolved.project,
+        resolved.mode,
+        settings,
+        backendConfig,
+      );
       process.exit(0);
       return;
     }

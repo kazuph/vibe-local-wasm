@@ -13,10 +13,13 @@ CLI/TUI の体験は本家 vibe-local に準拠します。本家にないコマ
 
 - CLI
   - interactive `chat`
-  - `/help` `/exit` `/clear`
-  - `/status` `/compact`
-  - `/model <name>`
-  - `/plan` `/approve`
+  - `/help` `/exit` `/clear` `/save`
+  - `/status` `/tokens` `/config` `/compact`
+  - `/model <name>` `/models`
+  - `/plan` `/approve` `/yes`
+  - `/diff` `/git <args>` `/commit`
+  - `/checkpoint` `/rollback`
+  - `/autotest` `/watch` `/skills` `/init`
 - runtime
   - vendored `vibe-coder.py` を Pyodide で実行
   - agentOS manager
@@ -24,9 +27,9 @@ CLI/TUI の体験は本家 vibe-local に準拠します。本家にないコマ
 
 後回しのままのもの:
 
-- file watcher
-- auto-test loop
-- checkpoint / rollback
+- file watcher の actor loop 連携
+- auto-test loop の自動実行
+- checkpoint / rollback の完全な upstream parity
 
 ## Repository layout
 
@@ -119,11 +122,25 @@ interactive chat では次が使えます。
 
 - `/help`
 - `/clear`
+- `/save`
 - `/status`
+- `/tokens`
+- `/config`
 - `/compact`
 - `/model <name>`
+- `/models`
 - `/plan`
 - `/approve`
+- `/yes`
+- `/diff`
+- `/git <args>`
+- `/commit`
+- `/checkpoint`
+- `/rollback`
+- `/autotest`
+- `/watch`
+- `/skills`
+- `/init`
 - `/exit`
 
 ## Web UI behavior
