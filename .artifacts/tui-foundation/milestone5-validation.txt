@@ -1,0 +1,16 @@
+Milestone 5 validation
+======================
+
+Commands:
+- pnpm run check
+- pnpm run build
+- pnpm run smoke
+
+Result:
+- pnpm run check: passed
+- pnpm run build: passed
+- pnpm run smoke: passed
+
+Evidence:
+- docs/mcp-layering.md defines the control-plane vs sandbox MCP split
+- server startup now reports MCP layering from the typed contract

@@ -1,38 +1,43 @@
 # Sandbox contract
 
-This document defines the **explicit delegation boundary** between the trusted
-`agentOS / Pyodide` control plane and the external sandbox execution plane.
+This document defines the current execution boundary for `vibe-local-wasm`.
 
-## Control-plane ownership
+## Core rule
 
-The sandbox is a service, not the owner of state. The control plane keeps:
+- **agentOS / Wasm** owns session state, approvals, audit, routing, and capability decisions.
+- **workspace capability surface** handles bounded file and web operations.
+- **external sandbox** is an execution service for work that cannot stay inside the trusted core.
 
-- session state
-- approvals and permissions
-- audit trail
-- tool routing
-- capability decisions
+The sandbox is **not** the source of truth for sessions, approvals, or workspace state.
 
-## Delegated operation classes
+## Explicit delegated execution classes
 
-Only these operation classes are allowed to cross into the external sandbox:
+Only these classes should be handed to the external sandbox:
 
-| Class | Why delegated | Examples |
-|------|---------------|----------|
-| `arbitrary-bash` | generic shell access cannot be reduced to a structured capability safely | shell pipelines, interactive shell flows |
-| `native-subprocess` | depends on host binaries or language runtimes outside Wasm | `execFileSync`, native CLI helpers |
-| `build-test-workflow` | compiler / package-manager / test-runner flows depend on host toolchains | `pnpm run build`, `pytest`, `cargo test` |
-| `mcp-server-spawn` | MCP server processes and stdio bridges must not run inside the trusted core | future stdio MCP launch |
+| Class | Why it is delegated | Examples |
+|------|----------------------|----------|
+| `arbitrary-bash` | Unstructured shell access cannot be audited as a narrow capability | shell pipelines, ad hoc commands |
+| `native-subprocess` | Depends on host runtimes / binaries outside the Wasm core | `python`, `go`, `cargo`, language CLIs |
+| `build-test-runner` | Package-manager and compiler-heavy workflows are non-WASM in practice | `pnpm run build`, `pytest`, `cargo test` |
+| `full-coding-agent` | Full external coding agents should run as a service, not inside control-plane policy code | Codex / Claude Code sessions |
+| `mcp-server-spawn` | MCP process launch belongs to a narrower external execution surface | stdio MCP servers, local bridges |
 
-Anything outside this list should stay in the control plane or be introduced as
-a new structured capability first.
+## Keep in the control plane when bounded safely
 
-## Current implementation hooks
+- session state and transcript persistence
+- approvals and audit trail
+- tool routing and capability checks
+- sub-agent orchestration
+- task state management
 
-- `tools/agentos-dev/src/shared/sandbox-contract.ts`
-- `tools/agentos-dev/src/registry.ts`
-- `tools/agentos-dev/src/server.ts`
-- `tools/agentos-dev/src/doctor.ts`
+## Keep in the workspace capability surface
 
-Those files now share the same contract summary so future work does not widen
-the sandbox role silently in docs only.
+- repo inspection
+- bounded file read/write/edit
+- glob and grep under sandbox policy
+- structured web fetch / search
+- workspace scratch files
+
+## Current implementation note
+
+The Pyodide bridge still contains bounded host-backed operations, including a restricted `Bash` path. That escape hatch exists for compatibility, but it does **not** expand the sandbox contract. The direction is to keep making the bounded capability surface clearer while reserving the external sandbox for the explicit classes above.

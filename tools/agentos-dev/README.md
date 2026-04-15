@@ -15,7 +15,7 @@
 - sandbox 側は **non-WASM task 用 execution plane**
 - 状態管理・認可・監査・ルーティングは agentOS 側から外に出さない
 - Bash / subprocess / build / test / MCP spawn のような非WASM処理だけを sandbox に送る
-- その委譲クラスの一覧は `../../docs/sandbox-contract.md` と `src/shared/sandbox-contract.ts` を正とする
+- 明示的な sandbox 委譲クラスは `../../docs/sandbox-contract.md` に固定する
 
 ## 重要な前提
 
@@ -61,10 +61,13 @@ CLI からは同じ `vibeLocal` actor を直接叩き、会話・compact artifac
 
 - checkpoint / rollback
 
-未完了のまま残っている主なものです。
+次の重点は:
 
+- explicit sandbox contract
+- virtual workspace model
 - MCP layering
-- より capability-native な workspace ownership
+
+MCP の layering は `../../docs/mcp-layering.md` と `src/shared/mcp-contract.ts` に固定する。
 
 ## 環境変数
 
@@ -86,3 +89,4 @@ CLI からは同じ `vibeLocal` actor を直接叩き、会話・compact artifac
 - 旧 Web UI を使う場合は `vibe-local-pyodide` 側の Vite middleware からも同じ actor を叩けますが、現行の主経路は CLI です
 - browser 側の localStorage / sql.js は archived web surface の話で、CLI path では actor-local SQLite が主経路です
 - `tools/agentos-dev/.agentos-dev/workspace` は現状 host filesystem を正としているが、将来は capability-mediated workspace を厚くしていく方針です
+- workspace ownership の設計は `WORKSPACE_OWNERSHIP.md` と `../../docs/workspace-model.md` にまとめる

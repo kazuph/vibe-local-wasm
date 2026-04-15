@@ -23,7 +23,7 @@
 
 つまり、外部 sandbox は **execution plane** であり、主導権は常に agentOS / Wasm 側に残します。
 
-明示的な委譲境界は `docs/sandbox-contract.md` にまとめています。
+明示的な sandbox 委譲クラスは `docs/sandbox-contract.md` で固定しています。
 
 CLI/TUI の体験は本家 vibe-local に準拠します。本家にないコマンドや API は原則として実装しません。
 
@@ -46,11 +46,17 @@ CLI/TUI の体験は本家 vibe-local に準拠します。本家にないコマ
   - actor-local SQLite persistence
   - JS bridge for `WebSearch` / `NotebookEdit` / `Task*` / `AskUserQuestion`
 
-未完了のまま残っている主なもの:
+実装済みの CLI quality gap:
 
-- MCP 連携
-- より capability-native な workspace abstraction
-- sandbox 契約のさらなる狭域化
+- `/watch`
+- `/autotest`
+- `/undo`
+
+次の主要ロードマップ:
+
+- explicit sandbox contract
+- virtual workspace model
+- MCP layering
 
 ## Repository layout
 
@@ -145,6 +151,7 @@ interactive chat では次が使えます。
 - `/diff`
 - `/git <args>`
 - `/commit`
+- `/undo`
 - `/checkpoint`
 - `/rollback`
 - `/autotest`
@@ -181,6 +188,13 @@ CLI の既定設定は `~/.config/opencode/config.json` から読みます。
   - host toolkit と Pi を載せる
 - `codingSandbox`
   - Wasm では扱いづらい処理だけを逃がす external execution plane
+
+関連文書:
+
+- `docs/sandbox-contract.md`
+- `docs/mcp-layering.md`
+- `docs/workspace-model.md`
+- `docs/wasm-compat-mapping.md`
 
 ## Archived web surface
 

@@ -20,6 +20,7 @@
 | Agent core | `vibe-coder.py` runs in Pyodide | keep in Wasm |
 | Session state | actor-local SQLite | keep in control plane |
 | Tool routing | JS bridge from Pyodide | keep, but move toward capability-native tools |
+| Workspace abstraction | host-backed workspace + dormant AgentFS integration path | actor-owned workspace model + explicit host export/import |
 | File operations | bounded host-backed operations | capability-mediated workspace, less raw host dependency |
 | Bash/subprocess | host / sandbox dependent | sandbox-only for truly non-WASM tasks |
 | Sandbox role | general external execution plane | narrower, explicit non-WASM execution plane |
@@ -53,8 +54,8 @@
 | `SubAgent` / `ParallelAgents` | JS-side mini loop / worker coordination | good fit for control plane orchestration |
 | `Bash` | restricted execution path | keep as explicit escape hatch, not default architecture |
 | `NotebookEdit` / `Task*` / `AskUserQuestion` | JS bridge in control plane | keep in-core |
-| file watcher / auto-test | basic command support exists in control plane | keep policy/detection in control plane, narrow heavy execution further |
-| MCP | not finished | likely sandbox execution with control-plane ownership |
+| file watcher / auto-test | implemented with control-plane ownership | keep policy / audit in control plane, delegate heavy execution only when necessary |
+| MCP | typed contract for control-plane config + sandbox spawn | keep permissions/audit in control plane and process lifecycle in sandbox |
 
 ## 5. Design rules for future work
 
@@ -63,9 +64,6 @@
 3. Keep **policy, routing, approvals, and audit** in agentOS.
 4. When a feature cannot stay in Wasm, isolate it behind a narrow sandbox contract.
 5. Do not expand archived web paths into the main architecture unless they serve the CLI/Wasm core.
-
-The current explicit delegation list lives in `docs/sandbox-contract.md` and is
-mirrored in `tools/agentos-dev/src/shared/sandbox-contract.ts`.
 
 ## 6. What “more Wasm-native” means here
 

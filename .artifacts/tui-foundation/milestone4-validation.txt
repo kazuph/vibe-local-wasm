@@ -1,0 +1,16 @@
+Milestone 4 validation
+======================
+
+Commands:
+- pnpm run check
+- pnpm run build
+- pnpm run smoke
+
+Result:
+- pnpm run check: passed
+- pnpm run build: passed
+- pnpm run smoke: passed
+
+Evidence:
+- docs/workspace-model.md defines the actor-owned workspace target model
+- tools/agentos-dev/WORKSPACE_OWNERSHIP.md maps the design to current code

@@ -37,7 +37,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **control plane (trusted core)**: agentOS actor, Pyodide runtime, policy, audit, session state, tool routing
 - **execution plane (less-trusted)**: `codingSandbox` などの外部 sandbox。Bash / subprocess / build / test / MCP server spawn のような非WASM処理を担当
 - **design rule**: 状態管理・認可・監査・オーケストレーションは agentOS 側に残し、sandbox には主導権を渡さない
-- **explicit contract**: delegated operation classes are documented in `docs/sandbox-contract.md` and mirrored in `tools/agentos-dev/src/shared/sandbox-contract.ts`
 
 ## Pyodide ランタイム（実装済み）
 
@@ -165,7 +164,7 @@ CLI → vibeLocal actor → Pyodide runtime → agentOS Manager surfaces
 |-------|---------|----------|
 | Actor state (sessions, messages) | SQLite via RivetKit | `tools/agentos-dev/.agentos-dev/rivetkit/` |
 | Workspace files | Host filesystem | `tools/agentos-dev/.agentos-dev/workspace/` |
-| AgentFS mirror/audit | SQLite | `tools/agentos-dev/.agentos-dev/agentfs/workspace.db` |
+| AgentFS integration path | SQLite | `tools/agentos-dev/.agentos-dev/agentfs/workspace.db` |
 | Browser fallback state (archived web) | localStorage / IndexedDB via sql.js | `vibe-local-pyodide/` side only |
 
 ## Environment Variables
@@ -198,9 +197,11 @@ CLI → vibeLocal actor → Pyodide runtime → agentOS Manager surfaces
 - **本家準拠**: CLI/TUI のコマンド体系は ochyai/vibe-local に準拠。本家にない独自コマンドは追加しない。
 - **Actor-local SQLite for conversations**: 現行の CLI path では会話本体も設定読み出しも host/actor 側を主に使う。
 - **Wasm-first control plane**: policy / audit / orchestration は agentOS + Pyodide 側に置き、非WASM処理だけを external sandbox に委譲する。
-- **AgentFS is a mirror/audit layer**: 現状は host filesystem が source of truth だが、長期的には capability-mediated workspace を厚くしていく。
+- **AgentFS integration exists but is not yet wired into the active runtime path**: 現状は host filesystem が source of truth で、長期的には capability-mediated workspace を厚くしていく。
 - **Execution modes**: Plan / Act（本家準拠）。YOLO は本家の `--yes` フラグに相当。
-- **本家との差分として今後さらに詰めるもの**: MCP連携、より capability-native な workspace model、sandbox 契約の狭域化
+- **Sandbox contract**: explicit delegated execution classes are documented in `docs/sandbox-contract.md`
+- **Current roadmap focus**: sandbox contract, virtual workspace evolution, MCP layering
+- **MCP layering**: configuration / permission / audit stay in the control plane; server spawn belongs to the sandbox
 
 ## Technology Stack
 

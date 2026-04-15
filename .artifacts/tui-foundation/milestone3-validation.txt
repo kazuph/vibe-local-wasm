@@ -1,0 +1,16 @@
+Milestone 3 validation
+======================
+
+Commands:
+- pnpm run check
+- pnpm run build
+- pnpm run smoke
+
+Result:
+- pnpm run check: passed
+- pnpm run build: passed
+- pnpm run smoke: passed
+
+Evidence:
+- runtime startup now prints explicit sandbox delegation classes
+- docs/sandbox-contract.md defines the delegated execution contract
