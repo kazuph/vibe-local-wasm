@@ -20,9 +20,9 @@ Today the repository uses three distinct persistence surfaces:
 |------|---------------|------------------|
 | actor state | source of truth for sessions, messages, approvals, artifacts, task state | `tools/agentos-dev/.agentos-dev/rivetkit/` |
 | workspace files | writable backing store used by the current runtime | `tools/agentos-dev/.agentos-dev/workspace/` |
-| AgentFS | mirror and audit layer for workspace activity | `tools/agentos-dev/.agentos-dev/agentfs/workspace.db` |
+| AgentFS | defined integration path, not actively wired into the current runtime | `tools/agentos-dev/.agentos-dev/agentfs/workspace.db` |
 
-This means the workspace is still effectively **host-backed**, even though the trusted control plane already owns the conversation and policy state.
+This means the workspace is still effectively **host-backed**, and the AgentFS path is currently architectural preparation rather than an active source of runtime behavior.
 
 ## Target state
 

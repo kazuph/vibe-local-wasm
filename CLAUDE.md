@@ -164,7 +164,7 @@ CLI → vibeLocal actor → Pyodide runtime → agentOS Manager surfaces
 |-------|---------|----------|
 | Actor state (sessions, messages) | SQLite via RivetKit | `tools/agentos-dev/.agentos-dev/rivetkit/` |
 | Workspace files | Host filesystem | `tools/agentos-dev/.agentos-dev/workspace/` |
-| AgentFS mirror/audit | SQLite | `tools/agentos-dev/.agentos-dev/agentfs/workspace.db` |
+| AgentFS integration path | SQLite | `tools/agentos-dev/.agentos-dev/agentfs/workspace.db` |
 | Browser fallback state (archived web) | localStorage / IndexedDB via sql.js | `vibe-local-pyodide/` side only |
 
 ## Environment Variables
@@ -197,7 +197,7 @@ CLI → vibeLocal actor → Pyodide runtime → agentOS Manager surfaces
 - **本家準拠**: CLI/TUI のコマンド体系は ochyai/vibe-local に準拠。本家にない独自コマンドは追加しない。
 - **Actor-local SQLite for conversations**: 現行の CLI path では会話本体も設定読み出しも host/actor 側を主に使う。
 - **Wasm-first control plane**: policy / audit / orchestration は agentOS + Pyodide 側に置き、非WASM処理だけを external sandbox に委譲する。
-- **AgentFS is a mirror/audit layer**: 現状は host filesystem が source of truth だが、長期的には capability-mediated workspace を厚くしていく。
+- **AgentFS integration exists but is not yet wired into the active runtime path**: 現状は host filesystem が source of truth で、長期的には capability-mediated workspace を厚くしていく。
 - **Execution modes**: Plan / Act（本家準拠）。YOLO は本家の `--yes` フラグに相当。
 - **Sandbox contract**: explicit delegated execution classes are documented in `docs/sandbox-contract.md`
 - **Current roadmap focus**: sandbox contract, virtual workspace evolution, MCP layering

@@ -6,14 +6,14 @@ This file maps the Milestone 4 workspace model to the current implementation.
 
 - actor state: `src/vibe-local-actor.ts`
 - registry mounts: `src/registry.ts`
-- AgentFS mirror/audit: `src/agentfs.ts`
+- AgentFS integration path: `src/agentfs.ts`
 - project discovery and script execution: `src/projects.ts`, `src/toolkits.ts`
 
 ## Current reality
 
 - actor-local SQLite already owns conversations and approvals
 - `/mnt/workspace` is backed by `tools/agentos-dev/.agentos-dev/workspace`
-- AgentFS records workspace changes but is not yet the primary write path
+- AgentFS integration code exists but is not actively wired into the current runtime path
 
 ## Implementation direction
 

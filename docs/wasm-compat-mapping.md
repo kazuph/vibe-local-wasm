@@ -20,7 +20,7 @@
 | Agent core | `vibe-coder.py` runs in Pyodide | keep in Wasm |
 | Session state | actor-local SQLite | keep in control plane |
 | Tool routing | JS bridge from Pyodide | keep, but move toward capability-native tools |
-| Workspace abstraction | host-backed workspace + AgentFS mirror | actor-owned workspace model + explicit host export/import |
+| Workspace abstraction | host-backed workspace + dormant AgentFS integration path | actor-owned workspace model + explicit host export/import |
 | File operations | bounded host-backed operations | capability-mediated workspace, less raw host dependency |
 | Bash/subprocess | host / sandbox dependent | sandbox-only for truly non-WASM tasks |
 | Sandbox role | general external execution plane | narrower, explicit non-WASM execution plane |
