@@ -281,6 +281,9 @@ export class FixedFooter {
       "/approve",
       "/model",
       "/compact",
+      "/undo",
+      "/watch",
+      "/autotest",
       "/exit",
       "ESC=stop",
     ];

@@ -1,4 +1,14 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { execSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+  watch,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { stdin as input, stdout as output } from "node:process";
@@ -17,6 +27,7 @@ import {
   errorColor,
   formatToolEvent,
   gray,
+  green,
   infoColor,
   promptColor,
   yellow,
@@ -186,6 +197,122 @@ async function watchSessionProgress(
 
   if (workError) {
     throw workError;
+  }
+}
+
+type FileChangeEvent = {
+  eventType: "change" | "rename";
+  filePath: string;
+  timestamp: string;
+};
+
+const WATCH_IGNORED_DIRS = ["node_modules", ".git", ".vibe-local", "dist", ".agentos-dev"];
+const WATCH_IGNORED_EXTS = [".db", ".sqlite", ".sqlite3", ".log", ".tmp"];
+const RECURSIVE_WATCH_SUPPORTED = process.platform === "darwin" || process.platform === "win32";
+
+function startFileWatcher(baseDir: string): {
+  drain: () => FileChangeEvent[];
+  stop: () => void;
+} {
+  const events: FileChangeEvent[] = [];
+  let active = true;
+  const options: { recursive: boolean } | { recursive: true } = RECURSIVE_WATCH_SUPPORTED
+    ? { recursive: true }
+    : { recursive: false as boolean };
+
+  try {
+    const watcher = watch(baseDir, options, (eventType, filename) => {
+      if (!active || !filename) return;
+      const filePath = filename.replace(/\\/g, "/");
+      if (WATCH_IGNORED_DIRS.some((d) => filePath.includes(`/${d}/`) || filePath.startsWith(`${d}/`))) return;
+      if (WATCH_IGNORED_EXTS.some((ext) => filePath.endsWith(ext))) return;
+      events.push({
+        eventType: eventType === "rename" ? "rename" : "change",
+        filePath,
+        timestamp: new Date().toISOString(),
+      });
+    });
+    return {
+      drain: () => {
+        const snapshot = [...events];
+        events.length = 0;
+        return snapshot;
+      },
+      stop: () => {
+        active = false;
+        try { watcher.close(); } catch { /* already closed */ }
+      },
+    };
+  } catch {
+    return {
+      drain: () => {
+        const snapshot = [...events];
+        events.length = 0;
+        return snapshot;
+      },
+      stop: () => { active = false; },
+    };
+  }
+}
+
+function resolveProjectDir(project: string): string {
+  const candidate = path.resolve(REPO_ROOT, project);
+  if (existsSync(candidate) && statSync(candidate).isDirectory()) {
+    return candidate;
+  }
+  return REPO_ROOT;
+}
+
+function detectTestCommand(projectDir: string): { cmd: string; type: string } | null {
+  const pkgPath = path.join(projectDir, "package.json");
+  if (existsSync(pkgPath)) {
+    try {
+      const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { scripts?: Record<string, string> };
+      if (pkg.scripts?.test && pkg.scripts.test !== "echo \"Error: no test specified\" && exit 1") {
+        return { cmd: "pnpm test", type: "pnpm" };
+      }
+      if (pkg.scripts?.["test:unit"]) {
+        return { cmd: "pnpm run test:unit", type: "pnpm" };
+      }
+    } catch { /* not valid JSON */ }
+  }
+  if (existsSync(path.join(projectDir, "pytest.ini")) || existsSync(path.join(projectDir, "pyproject.toml"))) {
+    return { cmd: "pytest", type: "pytest" };
+  }
+  if (existsSync(path.join(projectDir, "Cargo.toml"))) {
+    return { cmd: "cargo test", type: "cargo" };
+  }
+  return null;
+}
+
+function runAutoTest(projectDir: string): { cmd: string; ok: boolean; output: string } | null {
+  const detected = detectTestCommand(projectDir);
+  if (!detected) return null;
+  const { cmd, type } = detected;
+  const binDir = type === "pnpm"
+    ? path.resolve(projectDir, "node_modules", ".bin")
+    : undefined;
+  const env: NodeJS.Dict<string> = {
+    ...process.env,
+    FORCE_COLOR: "0",
+    CI: "1",
+  };
+  if (binDir) {
+    env.PATH = `${binDir}:${process.env.PATH ?? ""}`;
+  }
+  try {
+    const stdout = execSync(cmd, {
+      cwd: projectDir,
+      encoding: "utf8",
+      env,
+      timeout: 60_000,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    return { ok: true, output: stdout.slice(-2000), cmd };
+  } catch (err: unknown) {
+    const e = err as { stdout?: string; stderr?: string; status?: number };
+    const combined = [e.stdout, e.stderr].filter(Boolean).join("\n").slice(-2000);
+    return { ok: false, output: combined || "test command failed", cmd };
   }
 }
 
@@ -828,6 +955,7 @@ async function runInteractiveChat(
   let checkpointRef: string | null = null;
   let autoTestEnabled = false;
   let watchEnabled = false;
+  let fileWatcher: { drain: () => FileChangeEvent[]; stop: () => void } | null = null;
 
   const footer = new FixedFooter({
     model: settings.model,
@@ -880,10 +1008,11 @@ async function runInteractiveChat(
         console.log(`  ${cyan("/diff")}          Show git diff`);
         console.log(`  ${cyan("/git")} ${gray("<args>")}   Run a git command`);
         console.log(`  ${cyan("/commit")}        Draft a commit message and optionally commit`);
+        console.log(`  ${cyan("/undo")}          Remove the last conversation turn`);
         console.log(`  ${cyan("/checkpoint")}    Save a tracked-files git checkpoint`);
         console.log(`  ${cyan("/rollback")}      Restore the last checkpoint`);
-        console.log(`  ${cyan("/autotest")}      Toggle post-edit autotest placeholder`);
-        console.log(`  ${cyan("/watch")}         Toggle file-watch placeholder`);
+        console.log(`  ${cyan("/autotest")}      Toggle post-edit autotest (runs tests after file changes)`);
+        console.log(`  ${cyan("/watch")}         Toggle file watcher (reports external file changes)`);
         console.log(`  ${cyan("/skills")}        List available skill files`);
         console.log(`  ${cyan("/init")}          Create a CLAUDE.md template if missing`);
         continue;
@@ -1163,6 +1292,51 @@ async function runInteractiveChat(
         continue;
       }
 
+      if (line === "/undo") {
+        let confirmed = mode === "yolo";
+        if (!confirmed) {
+          const answer = (await rl.question(cyan("Remove last conversation turn? [y/N] ")))
+            .trim()
+            .toLowerCase();
+          confirmed = answer === "y" || answer === "yes";
+        }
+        if (!confirmed) {
+          console.log(yellow("Undo aborted."));
+          continue;
+        }
+        try {
+          const result = (await actor.undoLastTurn(sessionId)) as {
+            changed: boolean;
+            removedCount: number;
+            removedPreview?: string;
+            cascadeCounts?: { artifacts: number; approvals: number; subAgents: number; taskCleared: boolean };
+          };
+          if (result.changed) {
+            console.log(infoColor(`Removed ${result.removedCount} message(s) from the last turn.`));
+            if (result.cascadeCounts) {
+              const cc = result.cascadeCounts;
+              const parts: string[] = [];
+              if (cc.artifacts > 0) parts.push(`${cc.artifacts} artifact(s)`);
+              if (cc.approvals > 0) parts.push(`${cc.approvals} approval(s)`);
+              if (cc.subAgents > 0) parts.push(`${cc.subAgents} sub-agent(s)`);
+              if (cc.taskCleared) parts.push("task state");
+              if (parts.length > 0) {
+                console.log(dim(`  Also removed: ${parts.join(", ")}`));
+              }
+            }
+            if (result.removedPreview) {
+              const preview = result.removedPreview.split("\n").slice(0, 3).join("\n");
+              console.log(dim(preview));
+            }
+          } else {
+            console.log(yellow("Nothing to undo."));
+          }
+        } catch (err) {
+          console.log(errorColor(`undo failed: ${err instanceof Error ? err.message : String(err)}`));
+        }
+        continue;
+      }
+
       if (line === "/checkpoint") {
         const checkpoint = await runGit(["stash", "create", `cli-checkpoint-${sessionId.slice(0, 8)}`]);
         if (!checkpoint.ok) {
@@ -1219,15 +1393,40 @@ async function runInteractiveChat(
 
       if (line === "/autotest") {
         autoTestEnabled = !autoTestEnabled;
+        const projectDir = resolveProjectDir(currentProject);
         console.log(`Auto-test: ${autoTestEnabled ? infoColor("ON") : errorColor("OFF")}`);
-        console.log(dim("Phase 3 placeholder: command surface is wired; automatic test hooks land later."));
+        if (autoTestEnabled) {
+          const detected = detectTestCommand(projectDir);
+          if (detected) {
+            console.log(dim(`  Detected test command: ${detected.cmd} (${detected.type})`));
+            console.log(dim(`  Project directory: ${projectDir}`));
+          } else {
+            console.log(yellow("  No test command detected for this project. Tests will not run."));
+          }
+        }
         continue;
       }
 
       if (line === "/watch") {
         watchEnabled = !watchEnabled;
         console.log(`File watcher: ${watchEnabled ? infoColor("ON") : errorColor("OFF")}`);
-        console.log(dim("Phase 3 placeholder: external file change monitoring is not wired into the actor loop yet."));
+        if (watchEnabled) {
+          const projectDir = resolveProjectDir(currentProject);
+          fileWatcher?.stop();
+          if (!RECURSIVE_WATCH_SUPPORTED) {
+            console.log(yellow("  WARNING: fs.watch recursive is not supported on this platform."));
+            console.log(yellow("  Only top-level directory changes will be detected. Subdirectory changes may be missed."));
+            console.log(dim(`  Monitoring: ${projectDir} (shallow)`));
+          } else {
+            console.log(dim(`  Watching: ${projectDir}`));
+          }
+          fileWatcher = startFileWatcher(projectDir);
+          console.log(dim("  External file changes will be reported when detected."));
+        } else {
+          fileWatcher?.stop();
+          fileWatcher = null;
+          console.log(dim("  File watcher stopped."));
+        }
         continue;
       }
 
@@ -1284,6 +1483,40 @@ async function runInteractiveChat(
           const taskStatus = (result?.task as Record<string, unknown>)?.status ?? "unknown";
           console.log(dim(`task: ${taskStatus}`));
         }
+
+        if (watchEnabled && fileWatcher) {
+          const changeEvents = fileWatcher.drain();
+          if (changeEvents.length > 0) {
+            const summary = changeEvents
+              .slice(0, 10)
+              .map((e) => `  ${e.eventType}: ${e.filePath}`)
+              .join("\n");
+            const overflow = changeEvents.length > 10 ? `\n  ... and ${changeEvents.length - 10} more` : "";
+            console.log(dim(`\nFile changes detected since last turn:`));
+            console.log(dim(`${summary}${overflow}`));
+          }
+        }
+
+        if (autoTestEnabled) {
+          const projectDir = resolveProjectDir(currentProject);
+          const detected = detectTestCommand(projectDir);
+          if (detected) {
+            console.log(dim(`Running auto-test: ${detected.cmd}`));
+            const testResult = runAutoTest(projectDir);
+            if (testResult) {
+              if (testResult.ok) {
+                console.log(green(`auto-test passed (${testResult.cmd})`));
+              } else {
+                console.log(errorColor(`auto-test failed (${testResult.cmd})`));
+                const lines = testResult.output.split("\n");
+                const tail = lines.slice(-8).join("\n");
+                if (tail) {
+                  console.log(dim(tail));
+                }
+              }
+            }
+          }
+        }
       } catch (err) {
         footer.update({ status: "error" });
         const msg = err instanceof Error ? err.message : String(err);
@@ -1294,6 +1527,7 @@ async function runInteractiveChat(
       }
     }
   } finally {
+    fileWatcher?.stop();
     footer.teardown();
     rl.close();
   }

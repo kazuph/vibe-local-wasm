@@ -1045,6 +1045,89 @@ export const vibeLocalActor = actor({
     exportSession: async (c, sessionId: string) => {
       return await getSnapshot(c.db, sessionId);
     },
+    undoLastTurn: async (c, sessionId: string) => {
+      const snapshot = await requireSnapshot(c.db, sessionId);
+      if (snapshot.messages.length === 0) {
+        return { changed: false, removedCount: 0 } as const;
+      }
+      let lastUserIdx = -1;
+      for (let i = snapshot.messages.length - 1; i >= 0; i -= 1) {
+        if (snapshot.messages[i].role === "user") {
+          lastUserIdx = i;
+          break;
+        }
+      }
+      if (lastUserIdx < 0) {
+        return { changed: false, removedCount: 0 } as const;
+      }
+      const removed = snapshot.messages.slice(lastUserIdx);
+      const lastUserTime = removed[0].createdAt;
+      const removedMsgCount = removed.length;
+
+      await c.db.execute(
+        `DELETE FROM messages WHERE session_id = ? AND turn_index >= ?`,
+        sessionId,
+        removed[0].turnIndex,
+      );
+
+      const removedArtifacts = snapshot.artifacts.filter(
+        (a) => a.createdAt >= lastUserTime,
+      );
+      for (const artifact of removedArtifacts) {
+        await c.db.execute(
+          `DELETE FROM artifacts WHERE id = ?`,
+          artifact.id,
+        );
+      }
+
+      const removedApprovals = snapshot.approvals.filter(
+        (a) => a.createdAt >= lastUserTime,
+      );
+      for (const approval of removedApprovals) {
+        await c.db.execute(
+          `DELETE FROM approvals WHERE id = ?`,
+          approval.id,
+        );
+      }
+
+      const removedSubAgents = snapshot.subAgents.filter(
+        (a) => a.createdAt >= lastUserTime,
+      );
+      for (const subAgent of removedSubAgents) {
+        await c.db.execute(
+          `DELETE FROM sub_agents WHERE id = ?`,
+          subAgent.id,
+        );
+      }
+
+      const task = snapshot.task;
+      let taskCleared = false;
+      if (task && task.createdAt >= lastUserTime) {
+        await c.db.execute(
+          `DELETE FROM task_state WHERE session_id = ?`,
+          sessionId,
+        );
+        taskCleared = true;
+      }
+
+      const now = nowIso();
+      await c.db.execute(
+        `UPDATE sessions SET updated_at = ? WHERE id = ?`,
+        now,
+        sessionId,
+      );
+      return {
+        changed: true,
+        removedCount: removedMsgCount,
+        removedPreview: removed.map((m) => `${m.role}: ${m.content.slice(0, 80)}`).join("\n"),
+        cascadeCounts: {
+          artifacts: removedArtifacts.length,
+          approvals: removedApprovals.length,
+          subAgents: removedSubAgents.length,
+          taskCleared,
+        },
+      } as const;
+    },
     runAgentTurn: async (
       c,
       sessionId: string,
