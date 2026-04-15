@@ -110,6 +110,8 @@ type AskLine = (query: string) => Promise<string>;
 const CSI = "\x1b[";
 const BRACKETED_PASTE_ENABLE = "\x1b[?2004h";
 const BRACKETED_PASTE_DISABLE = "\x1b[?2004l";
+const KITTY_KEYBOARD_ENABLE = "\x1b[>1u";
+const KITTY_KEYBOARD_DISABLE = "\x1b[<u";
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
 const SHIFT_ENTER_SEQUENCES = ["\x1b[13;2u", "\x1b[27;2;13~", "\x1b\r", "\x1b\n"];
@@ -1182,6 +1184,10 @@ async function runInteractiveChat(
   footer.setup();
 
   const askLine = (query: string) => askLineWithReadline(query);
+  const kittyKeyboardEnabled = output.isTTY && input.isTTY;
+  if (kittyKeyboardEnabled) {
+    output.write(KITTY_KEYBOARD_ENABLE);
+  }
   console.log(infoColor(`session=${sessionId.slice(0, 8)} project=${currentProject} mode=${mode}`));
   console.log(gray("Type a message or use /help for commands. Enter sends; Shift+Enter and paste keep newlines."));
 
@@ -1750,6 +1756,9 @@ async function runInteractiveChat(
     }
   } finally {
     fileWatcher?.stop();
+    if (kittyKeyboardEnabled) {
+      output.write(KITTY_KEYBOARD_DISABLE);
+    }
     footer.teardown();
   }
 }
