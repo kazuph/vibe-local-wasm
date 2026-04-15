@@ -15,7 +15,7 @@
 - sandbox 側は **non-WASM task 用 execution plane**
 - 状態管理・認可・監査・ルーティングは agentOS 側から外に出さない
 - Bash / subprocess / build / test / MCP spawn のような非WASM処理だけを sandbox に送る
-- 明示的な sandbox 委譲クラスは `../../docs/sandbox-contract.md` に固定する
+- 明示的な execution contract は `../../docs/sandbox-contract.md` で説明し、`src/shared/execution-contract.ts` を実装の正本とする
 
 ## 重要な前提
 
@@ -34,9 +34,9 @@ pnpm run agentos
 project を開く（debug / inspection 用）:
 
 ```bash
-pnpm agentos:open -- --project vibe-local-pyodide
-pnpm agentos:open -- --project vibe-local-pyodide --surface workspace
-pnpm agentos:open -- --project vibe-local-pyodide --surface sandbox --agent codex
+pnpm run open -- --project vibe-local-pyodide
+pnpm run open -- --project vibe-local-pyodide --surface workspace
+pnpm run open -- --project vibe-local-pyodide --surface sandbox --agent codex
 ```
 
 CLI からは project selector を渡して使う:

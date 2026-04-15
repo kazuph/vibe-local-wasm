@@ -23,7 +23,8 @@
 
 つまり、外部 sandbox は **execution plane** であり、主導権は常に agentOS / Wasm 側に残します。
 
-明示的な sandbox 委譲クラスは `docs/sandbox-contract.md` で固定しています。
+明示的な execution contract は `docs/sandbox-contract.md` に説明があり、
+実装側の正本は `tools/agentos-dev/src/shared/execution-contract.ts` です。
 
 CLI/TUI の体験は本家 vibe-local に準拠します。本家にないコマンドや API は原則として実装しません。
 
@@ -44,7 +45,7 @@ CLI/TUI の体験は本家 vibe-local に準拠します。本家にないコマ
   - vendored `vibe-coder.py` を Pyodide で実行
   - agentOS manager
   - actor-local SQLite persistence
-  - JS bridge for `WebSearch` / `NotebookEdit` / `Task*` / `AskUserQuestion`
+  - JS bridge for file / web / task / sub-agent tools
 
 実装済みの CLI quality gap:
 
@@ -195,6 +196,7 @@ CLI の既定設定は `~/.config/opencode/config.json` から読みます。
 - `docs/mcp-layering.md`
 - `docs/workspace-model.md`
 - `docs/wasm-compat-mapping.md`
+- `tools/agentos-dev/src/shared/execution-contract.ts`
 
 ## Archived web surface
 
