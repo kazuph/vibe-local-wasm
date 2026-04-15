@@ -16,11 +16,7 @@ const scriptMap = {
   check: ["run", "check"],
   dev: ["run", "dev"],
   doctor: ["run", "doctor"],
-  health: ["run", "health"],
-  open: ["run", "open"],
-  projects: ["run", "projects"],
   smoke: ["run", "smoke"],
-  web: ["run", "web"],
 };
 
 function printHelp() {
@@ -30,13 +26,10 @@ function printHelp() {
       "",
       "Usage:",
       "  vibe-local-wasm dev",
-      "  vibe-local-wasm web",
       "  vibe-local-wasm agentos",
-      "  vibe-local-wasm health",
-      "  vibe-local-wasm projects",
-      "  vibe-local-wasm chat <project> [--mode plan|act|yolo]",
+      "  vibe-local-wasm chat <project> [options]",
+      "  vibe-local-wasm --version",
       "  vibe-local-wasm cli <args...>",
-      "  vibe-local-wasm open",
       "",
       "Any unknown subcommand is forwarded to the actor-backed CLI.",
     ].join("\n"),

@@ -1,63 +1,13 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-
 import { hostTool, toolKit } from "@rivet-dev/agent-os-core";
 import { z } from "zod";
 
-import { REPO_ROOT } from "./config.js";
 import {
   discoverProjects,
   readProjectPackageJson,
   resolveProject,
   runProjectScript,
 } from "./projects.js";
-
-const execFileAsync = promisify(execFile);
-
-async function runGit(args: string[]) {
-  try {
-    const { stdout, stderr } = await execFileAsync("git", args, {
-      cwd: REPO_ROOT,
-      timeout: 20_000,
-      maxBuffer: 1024 * 1024 * 2,
-    });
-
-    return { ok: true, stdout, stderr };
-  } catch (error) {
-    const typed = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string };
-    return {
-      ok: false,
-      stdout: typed.stdout ?? "",
-      stderr: typed.stderr ?? typed.message,
-    };
-  }
-}
-
-async function searchCode(query: string, maxResults: number) {
-  const { stdout } = await execFileAsync(
-    "rg",
-    [
-      "-n",
-      "--hidden",
-      "--glob",
-      "!**/node_modules/**",
-      "--glob",
-      "!**/.git/**",
-      "--glob",
-      "!tools/agentos-dev/node_modules/**",
-      query,
-      REPO_ROOT,
-    ],
-    {
-      cwd: REPO_ROOT,
-      timeout: 20_000,
-      maxBuffer: 1024 * 1024 * 4,
-    },
-  );
-
-  const lines = stdout.trim().split("\n").filter(Boolean);
-  return lines.slice(0, maxResults);
-}
+import { runGit, searchCode } from "./shared/git-utils.js";
 
 export const repoToolkit = toolKit({
   name: "repo",
@@ -86,8 +36,8 @@ export const repoToolkit = toolKit({
       },
       examples: [
         {
-          description: "Inspect the bundled web client",
-          input: { project: "vibe-local-pyodide" },
+          description: "Inspect the active CLI/runtime package",
+          input: { project: "@vibe-local-wasm/agentos" },
         },
       ],
     }),
@@ -103,8 +53,8 @@ export const repoToolkit = toolKit({
       },
       examples: [
         {
-          description: "Run the web client checks",
-          input: { project: "vibe-local-pyodide", script: "check", timeoutMs: 120000 },
+          description: "Run the CLI/runtime checks",
+          input: { project: "@vibe-local-wasm/agentos", script: "check", timeoutMs: 120000 },
         },
       ],
     }),

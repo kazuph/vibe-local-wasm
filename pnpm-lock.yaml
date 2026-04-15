@@ -25,6 +25,9 @@ importers:
       agentfs-sdk:
         specifier: ^0.6.4
         version: 0.6.4
+      pyodide:
+        specifier: ^0.28.3
+        version: 0.28.3
       rivetkit:
         specifier: 2.2.1
         version: 2.2.1(@standard-schema/spec@1.0.0)(pyodide@0.28.3)(ws@8.20.0)

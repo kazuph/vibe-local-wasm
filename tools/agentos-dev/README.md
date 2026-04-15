@@ -1,13 +1,21 @@
 # agentOS Hybrid Dev Runtime
 
-このディレクトリは `vibe-local-wasm` 用の開発オーケストレーション層です。`pnpm-workspace` の一部としてぶら下がり、browser UI と actor runtime をまとめて起動します。
+このディレクトリは `vibe-local-wasm` 用の開発オーケストレーション層です。現行の主経路は CLI/TUI で、ここが actor runtime / registry / CLI をまとめて提供します。
 
 ## 何をしているか
 
-- `workspaceVm`: `agentOS` 上で Pi と host toolkits を動かす高速な VM
-- `codingSandbox`: `sandbox-agent` を `local` provider 経由で起動する coding agent 実行面
-- `vibeLocal`: `vibe-local-pyodide` の session / transcript を actor-local SQLite に保存する browser-core actor
+- `vibeLocal`: CLI と旧 Web UI の session / transcript を actor-local SQLite に保存する trusted control plane actor
+- `workspaceVm`: `agentOS` 上で Pi と capability-oriented host toolkits を動かす高速な VM
+- `codingSandbox`: `sandbox-agent` を `local` provider 経由で起動する external execution plane
 - repo 全体を `agentOS` に read-only mount し、host 側で project discovery と script 実行を補助
+
+## 設計原則
+
+- Wasm / agentOS 側が **control plane**
+- sandbox 側は **non-WASM task 用 execution plane**
+- 状態管理・認可・監査・ルーティングは agentOS 側から外に出さない
+- Bash / subprocess / build / test / MCP spawn のような非WASM処理だけを sandbox に送る
+- 明示的な sandbox 委譲クラスは `../../docs/sandbox-contract.md` に固定する
 
 ## 重要な前提
 
@@ -19,24 +27,11 @@
 ## 使い方
 
 ```bash
-pnpm doctor:agentos
-pnpm dev:agentos
-pnpm dev:vibe-local-agentos
+pnpm run doctor
+pnpm run agentos
 ```
 
-別ターミナルで self-check:
-
-```bash
-pnpm smoke:agentos
-```
-
-project 一覧:
-
-```bash
-pnpm agentos:list-projects
-```
-
-project を開く:
+project を開く（debug / inspection 用）:
 
 ```bash
 pnpm agentos:open -- --project vibe-local-pyodide
@@ -44,21 +39,15 @@ pnpm agentos:open -- --project vibe-local-pyodide --surface workspace
 pnpm agentos:open -- --project vibe-local-pyodide --surface sandbox --agent codex
 ```
 
-`vibe-local-pyodide` を `agentOS` 付きで使う:
+CLI からは project selector を渡して使う:
 
 ```bash
-pnpm dev:vibe-local-agentos
-pnpm vibe-local:cli health
-pnpm vibe-local:cli projects
-pnpm vibe-local:cli search "agentOS actor"
-pnpm vibe-local:cli run-script vibe-local-pyodide check
-pnpm vibe-local:cli agent-run vibe-local-pyodide "git status を見て要約して"
-pnpm vibe-local:cli read-file README.md
-printf 'hello from cli\n' | pnpm vibe-local:cli write-file tools/agentos-dev/.agentos-dev/workspace/note.txt
-pnpm vibe-local:cli read-agentfs-mirror tools/agentos-dev/.agentos-dev/workspace/note.txt
+pnpm run agentos
+pnpm run cli -- chat vibe-local-pyodide --mode act
+pnpm run cli -- chat vibe-local-pyodide --mode plan
 ```
 
-この状態で `http://localhost:5374/` を開くと、Status が `agentOS actor` になり、会話・セッション一覧・compact artifact が `vibeLocal` actor の SQLite に保存されます。browser からは project 選択、repo search、file open / save、git status / diff stat、script 実行に加えて、選択中 project を優先した tool-calling agent run ができます。CLI からは同じ `vibeLocal` actor を直接叩きます。
+CLI からは同じ `vibeLocal` actor を直接叩き、会話・compact artifact・task state が actor-local SQLite に保存されます。
 
 ## vibe-local parity の優先順位
 
@@ -66,16 +55,19 @@ pnpm vibe-local:cli read-agentfs-mirror tools/agentos-dev/.agentos-dev/workspace
 
 1. ツール実行の強化
 2. `Plan / Act / approve` フロー
-3. サブエージェント / 並列エージェント
+3. サブエージェント / 並列エージェント（Phase 6 で bridge 済み）
 
 次は採用しません。
 
 - checkpoint / rollback
 
-次は後回しです。
+次の重点は:
 
-- file watcher
-- auto-test loop
+- explicit sandbox contract
+- virtual workspace model
+- MCP layering
+
+MCP の layering は `../../docs/mcp-layering.md` と `src/shared/mcp-contract.ts` に固定する。
 
 ## 環境変数
 
@@ -94,6 +86,7 @@ pnpm vibe-local:cli read-agentfs-mirror tools/agentos-dev/.agentos-dev/workspace
 
 - actor key は `["browser-core"]`
 - 保存テーブルは `sessions`, `messages`, `artifacts`
-- `GET /__vibe_local/agentos/*` と `POST /__vibe_local/agentos/*` は `vibe-local-pyodide` の Vite middleware から actor を叩きます
-- backend settings は引き続き browser の localStorage に保存し、会話本体だけを actor-local SQLite に寄せています
-- `tools/agentos-dev/.agentos-dev/workspace` は引き続き host filesystem を正とし、AgentFS はその mirror / audit layer として並行保存します
+- 旧 Web UI を使う場合は `vibe-local-pyodide` 側の Vite middleware からも同じ actor を叩けますが、現行の主経路は CLI です
+- browser 側の localStorage / sql.js は archived web surface の話で、CLI path では actor-local SQLite が主経路です
+- `tools/agentos-dev/.agentos-dev/workspace` は現状 host filesystem を正としているが、将来は capability-mediated workspace を厚くしていく方針です
+- workspace ownership の設計は `WORKSPACE_OWNERSHIP.md` と `../../docs/workspace-model.md` にまとめる

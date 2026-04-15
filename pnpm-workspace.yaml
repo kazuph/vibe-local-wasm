@@ -1,6 +1,5 @@
 packages:
   - "tools/agentos-dev"
-  - "vibe-local-pyodide"
 
 onlyBuiltDependencies:
   - "@parcel/watcher"

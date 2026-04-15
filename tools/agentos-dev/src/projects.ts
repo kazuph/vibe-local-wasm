@@ -16,7 +16,6 @@ const SKIP_DIRS = new Set([
   "build",
   "coverage",
   "docs",
-  "tools",
 ]);
 
 export interface ProjectInfo {

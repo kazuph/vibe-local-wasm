@@ -1,0 +1,52 @@
+# Phase 8 validation
+
+$ pnpm run check
+
+> vibe-local-wasm@0.1.0 check /Users/kazuph/src/github.com/kazuph/vibe-local-wasm/.worktree/feature/tui-foundation
+> pnpm --filter @vibe-local-wasm/agentos run check
+
+
+> @vibe-local-wasm/agentos@ check /Users/kazuph/src/github.com/kazuph/vibe-local-wasm/.worktree/feature/tui-foundation/tools/agentos-dev
+> tsc -p tsconfig.json --noEmit
+
+
+$ pnpm run build
+
+> vibe-local-wasm@0.1.0 build /Users/kazuph/src/github.com/kazuph/vibe-local-wasm/.worktree/feature/tui-foundation
+> pnpm --filter @vibe-local-wasm/agentos run build
+
+
+> @vibe-local-wasm/agentos@ build /Users/kazuph/src/github.com/kazuph/vibe-local-wasm/.worktree/feature/tui-foundation/tools/agentos-dev
+> tsc -p tsconfig.json
+
+
+$ pnpm run smoke
+
+> vibe-local-wasm@0.1.0 smoke /Users/kazuph/src/github.com/kazuph/vibe-local-wasm/.worktree/feature/tui-foundation
+> pnpm --filter @vibe-local-wasm/agentos run smoke
+
+
+> @vibe-local-wasm/agentos@ smoke /Users/kazuph/src/github.com/kazuph/vibe-local-wasm/.worktree/feature/tui-foundation/tools/agentos-dev
+> tsx src/smoke.ts
+
+Smoke test passed.
+- manager endpoint: http://127.0.0.1:6420
+- repo entries visible in agentOS: 16
+- root package bytes visible in agentOS: 803
+- agentOS installed agents: pi, pi-cli, opencode, claude
+- sandbox health: ok
+- sandbox agents: claude, codex, opencode, amp, pi, cursor, mock
+- runProcess pwd: /Users/kazuph/src/github.com/kazuph/vibe-local-wasm/.worktree/feature/tui-foundation
+
+server logs
+(node:59843) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+Hybrid agent runtime is up.
+Rivet manager: http://127.0.0.1:6420
+Sandbox Agent provider port: 2468
+Repo mount: /mnt/repo -> /Users/kazuph/src/github.com/kazuph/vibe-local-wasm/.worktree/feature/tui-foundation
+Writable workspace mount: /mnt/workspace
+Discovered projects: 2
+- tools/agentos-dev (@vibe-local-wasm/agentos)
+- vibe-local-pyodide (@vibe-local-wasm/web)

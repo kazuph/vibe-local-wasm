@@ -1,0 +1,361 @@
+# vibe-local-wasm future roadmap for follow-up AI
+
+This document is a handoff plan for a separate AI or engineer.  
+It is intentionally detailed and assumes no hidden chat context.
+
+## 0. Mandatory completion report via tmux
+
+When you finish an implementation slice, and especially when you finish the full requested work, you must report back to the manager pane via tmux.
+
+- **manager pane ID:** `%19`
+- use your own pane ID as the prefix in the report
+- the report must be a single line
+- include success/failure, touched area, and commit SHA when available
+
+### Step 1: get your own pane ID
+
+```bash
+MY_PANE_ID=$(tmux display-message -p -t "$TMUX_PANE" '#{pane_id}')
+echo "$MY_PANE_ID"
+```
+
+### Step 2: send the completion report to pane `%19`
+
+Send text and Enter separately.
+
+```bash
+MY_PANE_ID=$(tmux display-message -p -t "$TMUX_PANE" '#{pane_id}')
+tmux send-keys -t %19 "[${MY_PANE_ID}] 完了: <what changed> / <validation> / <commit-sha-or-no-commit>"
+sleep 0.5
+tmux send-keys -t %19 Enter
+```
+
+Example:
+
+```bash
+MY_PANE_ID=$(tmux display-message -p -t "$TMUX_PANE" '#{pane_id}')
+tmux send-keys -t %19 "[${MY_PANE_ID}] 完了: /watch 実装、pnpm run check/build/smoke 通過、commit abc1234"
+sleep 0.5
+tmux send-keys -t %19 Enter
+```
+
+### Step 3: if the manager needs to reply to you
+
+The manager can answer back to your pane with:
+
+```bash
+CHILD_PANE_ID=%42
+tmux send-keys -t "${CHILD_PANE_ID}" "[%19] 受領: 続けて次の作業に進んでください"
+sleep 0.5
+tmux send-keys -t "${CHILD_PANE_ID}" Enter
+```
+
+See also: `.plan/tmux-reporting-manual.md`
+
+## 1. Core objective
+
+Move the repository toward this architecture:
+
+- **Wasm / agentOS = trusted control plane**
+- **external sandbox = non-WASM execution plane**
+- **no Docker requirement**
+- **agentOS keeps ownership of state, routing, approval, and audit**
+
+The goal is **not** “force everything into Wasm.”  
+The goal is to keep as much of the system as possible inside a safe, auditable Wasm/agentOS core and delegate only the irreducibly non-WASM work to a narrower external sandbox.
+
+## 2. Non-goals
+
+Do **not** optimize for these at the expense of the core objective:
+
+- blindly matching every niche upstream feature
+- maximizing shell compatibility
+- preserving legacy web UI as a first-class path
+- making sandbox execution the primary source of truth
+
+## 3. Current state summary
+
+### Completed already
+
+- Phases 1-7 from the previous cleanup/parity effort are done.
+- CLI/TUI is the primary path.
+- `vibe-coder.py` runs in Pyodide.
+- core tool bridge exists in `tools/agentos-dev/src/pyodide-runtime.ts`
+- `SubAgent` and `ParallelAgents` are bridged on the JS side.
+- `WebFetch` now handles non-UTF8 pages like Shift_JIS.
+
+### Still incomplete
+
+- `/watch`
+- `/autotest`
+- `/undo`
+- MCP integration
+- deeper capability-native workspace model
+- reducing raw host-bridge dependence for file/process operations
+
+## 4. Recommended work order
+
+### Track A — quality and reliability first
+
+Do this before large architectural rewrites:
+
+1. tighten tool-result reliability
+2. reduce repeated/unnecessary tool calls
+3. improve session recovery and error visibility
+4. harden port conflict handling and long-running task behavior
+
+Reason: architecture work is easier when the current baseline is stable.
+
+### Track B — capability-native architecture
+
+After reliability work, move on to these:
+
+1. clarify the capability boundary for file and web tools
+2. shrink the raw shell/subprocess surface
+3. make sandbox usage more explicit and narrower
+4. prepare a virtual-workspace-first model
+
+## 5. Concrete roadmap
+
+## Milestone 1 — finish the “commonly used” CLI quality gaps
+
+### Scope
+
+- make `/watch` and `/autotest` honest: either real or clearly scoped
+- add `/undo` only if it can be reliable and auditable
+- improve repeated tool-call behavior and result grounding
+
+### Files likely involved
+
+- `tools/agentos-dev/src/vibe-local-cli.ts`
+- `tools/agentos-dev/src/vibe-local-actor.ts`
+- `tools/agentos-dev/src/pyodide-runtime.ts`
+- `tools/agentos-dev/src/pyodide-core/vibe-coder.py` only if unavoidable
+
+### Guidance
+
+- Prefer implementing behavior on the JS/actor side instead of editing vendored Python.
+- If `/watch` is added, keep the **watch detection / event injection** in the control plane.
+- If `/autotest` is added, keep the **policy and routing** in the control plane; let heavy execution happen in sandbox.
+- Avoid adding new placeholder commands. Either wire a feature or document it as deferred.
+
+### Acceptance criteria
+
+- commands do not lie about their behavior
+- targeted reproductions exist in `.artifacts/`
+- `pnpm run check`, `pnpm run build`, and relevant CLI reproductions pass
+
+### Review note: current blockers before marking Milestone 1 complete
+
+The following issues were found in a Milestone 1 review and should be fixed before this milestone is considered complete:
+
+1. **`/autotest` uses unresolved relative project paths**
+   - `detectTestCommand(currentProject)` and `runAutoTest(currentProject)` should resolve from `REPO_ROOT`, matching the `/watch` path handling.
+   - Otherwise, autotest can silently mis-detect or no-op when the CLI is launched outside the repo root.
+2. **`/watch` silently degrades on Linux**
+   - `fs.watch(..., { recursive: true })` is not supported on Linux.
+   - The current catch-and-fallback path returns a dead watcher without surfacing the limitation, so the UI can report `watch ON` while nothing is actually monitored.
+3. **`/undo` only removes messages, not full turn state**
+   - Removing only rows from `messages` leaves `artifacts`, `task_state`, approvals, and sub-agent traces from the undone turn.
+   - This breaks the expectation that `/undo` rolls back the last turn in an auditable, internally consistent way.
+4. **`/undo` currently clears `task_state` unconditionally**
+   - `artifacts`, `approvals`, and `sub_agents` are filtered by `createdAt >= lastUserTime`, but `task_state` is deleted whenever it exists.
+   - Because `task_state` is one row per session, this can wipe an older task that predates the undone turn. Guard it with the same time boundary (`task.createdAt >= lastUserTime`) before deleting.
+5. **`/undo` rejects a single orphaned user message after a failed first turn**
+   - `persistMessage(..., \"user\", prompt)` happens before the agent run, so a failed first turn can leave `messages.length === 1`.
+   - The current guard `if (snapshot.messages.length < 2)` incorrectly blocks undo for that valid rollback target and leaves the orphaned message stuck in the session.
+
+## Milestone 2 — make the file/tool surface more capability-native
+
+### Scope
+
+Reduce the “raw host bridge” feel of:
+
+- `Read`
+- `Write`
+- `Edit`
+- `Glob`
+- `Grep`
+- `WebFetch`
+
+### Guidance
+
+- Introduce clearer capability boundaries instead of broad file/process access.
+- Keep the current execution-root restriction model, but make the surface easier to reason about.
+- Prefer structured operations over general shell escape paths.
+- If you need a new abstraction, put it in the JS runtime / actor layer rather than patching vendored Python.
+
+### Questions to answer during work
+
+1. Which tools can remain fully inside the trusted control plane?
+2. Which tools still need a host-backed implementation?
+3. Which of those can be narrowed to structured capabilities?
+
+### Acceptance criteria
+
+- it is easier to explain which operations are in-core vs delegated
+- file access policy remains enforced
+- no regression in current CLI flows
+
+### Review note: remaining Milestone 2 follow-ups
+
+Current progress is good: a shared `src/shared/capability-policy.ts` now centralizes path sandboxing and validation primitives, and `pyodide-runtime.ts` has started consuming it. However, the milestone is not fully closed yet because:
+
+1. **`glob.ts` and `grep.ts` still accept unsandboxed `input.path`**
+   - `input.path` is currently consumed directly as the search root.
+   - That means these structured tools do not yet enforce the same capability boundary, even though the shared policy module is imported.
+2. **`notebook-edit.ts` may now allow `/tmp` paths where it previously rejected non-repo paths**
+   - If that expansion is intentional, the behavior and error messaging must be clarified.
+   - If not intentional, the new policy integration needs to preserve the original repo-only guard instead of falling through on `/tmp`.
+3. **`glob.ts` and `grep.ts` must use `repoRoot` as the sandbox boundary**
+   - The structured tools should not freeze their security boundary to `process.cwd()` at module load time.
+   - `resolveAccessPath(input.path, repoRoot, TMP_ROOT, repoRoot)` is the correct shape here so the allowed sandbox matches the actual repo/tool root passed by the caller.
+
+## Milestone 3 — narrow the sandbox contract
+
+### Scope
+
+Define exactly when the system is allowed to use external sandbox execution.
+
+### Guidance
+
+- treat sandbox as a **service** called by the control plane
+- do not let sandbox become the owner of session or approval state
+- keep an explicit list of delegated operation classes:
+  - arbitrary Bash
+  - subprocess-heavy work
+  - build/test workflows
+  - future MCP server spawn
+
+### Files likely involved
+
+- `tools/agentos-dev/src/registry.ts`
+- `tools/agentos-dev/src/toolkits.ts`
+- `tools/agentos-dev/src/shared/git-utils.ts`
+- `tools/agentos-dev/src/pyodide-runtime.ts`
+- docs under `README.md`, `CLAUDE.md`, `docs/`
+
+### Acceptance criteria
+
+- the repo has a documented sandbox contract
+- new work does not silently expand sandbox scope
+- docs match implementation
+
+## Milestone 4 — plan the virtual workspace evolution
+
+### Problem
+
+Right now, host filesystem is still effectively the source of truth, with AgentFS as mirror/audit.
+
+### Goal
+
+Move toward a model where:
+
+- the trusted control plane owns a clearer workspace abstraction
+- host filesystem dependence is reduced
+- export/import to host is more explicit
+
+### Guidance
+
+- do **not** attempt a big-bang rewrite
+- first identify which existing flows truly require host FS
+- separate “workspace state” from “host persistence” conceptually
+
+### Deliverable
+
+A design doc or prototype, not necessarily full implementation.
+
+## Milestone 5 — MCP in the right architectural layer
+
+### Guidance
+
+- Do not add MCP by simply spawning arbitrary processes from the core path.
+- Prefer:
+  - control plane owns configuration, permissions, audit, tool exposure
+  - sandbox owns server process execution when needed
+
+### Acceptance criteria
+
+- clear trust boundary
+- auditable server configuration
+- no uncontrolled spawn path from the trusted core
+
+## 6. Validation protocol
+
+For every phase-sized change:
+
+1. run existing checks first
+2. implement
+3. run:
+   - `pnpm run check`
+   - `pnpm run build`
+   - `pnpm run smoke` when relevant
+4. add a focused repro under `.artifacts/...`
+5. commit only after validation
+
+This repository already follows a phase discipline where **validation and commit are required for completion**.
+After that, send the tmux completion report to pane `%19`.
+
+## 7. Repo files that matter most
+
+### Runtime and architecture
+
+- `tools/agentos-dev/src/pyodide-runtime.ts`
+- `tools/agentos-dev/src/vibe-local-actor.ts`
+- `tools/agentos-dev/src/vibe-local-cli.ts`
+- `tools/agentos-dev/src/registry.ts`
+- `tools/agentos-dev/src/toolkits.ts`
+- `tools/agentos-dev/src/projects.ts`
+
+### Documentation
+
+- `README.md`
+- `CLAUDE.md`
+- `tools/agentos-dev/README.md`
+- `docs/wasm-compat-mapping.md`
+
+### Evidence
+
+- `.artifacts/tui-foundation/`
+
+## 8. Rules for the next AI
+
+1. Do not assume archived web paths are first-class.
+2. Do not expand raw shell use unless absolutely necessary.
+3. Prefer JS/actor-side integration over modifying vendored Python.
+4. Keep trust-boundary explanations in sync with code.
+5. When in doubt, preserve agentOS/Wasm ownership and make sandbox narrower, not wider.
+6. After finishing implementation and validation, report completion to pane `%19` via tmux.
+
+## 9. Suggested immediate next task
+
+If continuing immediately, the best next task is:
+
+### “Make `/watch` and `/autotest` real without widening trust boundaries”
+
+Reason:
+
+- they are visible user-facing gaps
+- they fit the control-plane / execution-plane split well
+- they improve daily usability more than niche parity features
+
+Suggested split:
+
+- control plane:
+  - toggle state
+  - event injection
+  - audit
+  - policy
+- sandbox:
+  - actual test command execution
+  - expensive file-system-dependent operations
+
+If that proves too large, then do:
+
+### “Reduce repeated/fuzzy tool use and improve result grounding”
+
+Reason:
+
+- immediate UX payoff
+- low architectural risk
+- helps all future features

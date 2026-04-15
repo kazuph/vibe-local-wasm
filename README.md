@@ -1,49 +1,65 @@
 # vibe-local-wasm
 
-`vibe-local-wasm` は、`vibe-local` 風の coding agent 体験を Web と CLI の両方で使えるようにした standalone repository です。
+[ochyai/vibe-local](https://github.com/ochyai/vibe-local)（落合陽一氏による Free AI Coding Agent）の WASM 版です。
 
-現状の実装は、薄い chat-first UI の下に `agentOS + SQLite + sandbox-agent + AgentFS` を置く構成です。  
-Web でも CLI でも同じ actor-backed session を共有します。
+本家 `vibe-local` は Python stdlib only の単一ファイル (`vibe-coder.py`) で Ollama と直接通信するコーディングエージェントです。  
+本リポジトリはそのコア機能を `agentOS + SQLite + sandbox-agent + AgentFS` の上に再実装し、バックエンドを WASM (Pyodide) 上でも動かせるようにすることを目指しています。現時点で主に整備されているのは **CLI/TUI path** です。
+
+## Architecture direction
+
+この repo の目標は **「全部を無理に Wasm に押し込む」ことではなく、Wasm/agentOS を trusted control plane にし、Wasm で動かない処理だけを外部 sandbox に委譲すること** です。
+
+- **Wasm / agentOS 側**
+  - セッション状態
+  - 認可と監査
+  - tool routing
+  - capability 判定
+  - 可能な範囲の file / web / structured tool execution
+- **外部 sandbox 側**
+  - Wasm / Workers では扱いづらい処理
+  - 任意 Bash / subprocess
+  - 言語ランタイム依存の build / test
+  - 将来の MCP server spawn など
+
+つまり、外部 sandbox は **execution plane** であり、主導権は常に agentOS / Wasm 側に残します。
+
+明示的な sandbox 委譲クラスは `docs/sandbox-contract.md` で固定しています。
+
+CLI/TUI の体験は本家 vibe-local に準拠します。本家にないコマンドや API は原則として実装しません。
 
 ## 現在の実装状況
 
-この repository で実際に使えるもの:
+この repository でいま主に使うのは **CLI/TUI** です。
 
-- browser UI
-  - chat-first transcript
-  - backend settings の保存
-  - `Plan / Act / YOLO`
-  - pending approvals
-  - tool execution log
-  - sub-agent / parallel agent の進行表示
-  - session 一覧、compact、export
 - CLI
-  - `health`, `projects`, `project-info`
-  - `git-status`, `diff-stat`, `search`
-  - `read-file`, `write-file`, `run-script`
-  - `agent-run`, `agent-plan`, `agent-yolo`
   - interactive `chat`
-  - `sessions`, `session`, `watch-session`
-  - `continue-session`, `continue-subagent`
-  - `approval`
-  - `parallel-run`
+  - `/help` `/exit` `/clear` `/save`
+  - `/status` `/tokens` `/config` `/compact`
+  - `/model <name>` `/models`
+  - `/plan` `/approve` `/yes`
+  - `/diff` `/git <args>` `/commit`
+  - `/checkpoint` `/rollback`
+  - `/autotest` `/watch` `/skills` `/init`
 - runtime
-  - `agentOS` manager
-  - `sandbox-agent` local provider
+  - vendored `vibe-coder.py` を Pyodide で実行
+  - agentOS manager
   - actor-local SQLite persistence
-  - AgentFS workspace mirror
+  - JS bridge for `WebSearch` / `NotebookEdit` / `Task*` / `AskUserQuestion`
 
-後回しのままのもの:
+実装済みの CLI quality gap:
 
-- file watcher
-- auto-test loop
-- checkpoint / rollback
+- `/watch`
+- `/autotest`
+- `/undo`
+
+次の主要ロードマップ:
+
+- explicit sandbox contract
+- virtual workspace model
+- MCP layering
 
 ## Repository layout
 
-- `vibe-local-pyodide/`
-  - React + Vite の Web クライアント
-  - Pyodide ベースの local fallback も含む
 - `tools/agentos-dev/`
   - `agentOS` registry
   - actor runtime
@@ -52,11 +68,12 @@ Web でも CLI でも同じ actor-backed session を共有します。
   - AgentFS integration
 - `bin/vibe-local-wasm.mjs`
   - standalone command entrypoint
+- `vibe-local-pyodide/`
+  - 以前の Web UI 実験実装
+  - 現在の root workspace / root scripts の主経路には含めていない
 
-## Default ports
+## Active ports
 
-- Web UI: `5374`
-- Web preview: `4374`
 - agentOS manager: `6520`
 - sandbox-agent provider: `2568`
 
@@ -64,22 +81,13 @@ Web でも CLI でも同じ actor-backed session を共有します。
 
 - `AGENTOS_PORT`
 - `SANDBOX_AGENT_PORT`
-- `VIBE_LOCAL_PORT`
 - `SANDBOX_AGENT_LOG`
 
 ## Quick start
 
 ```bash
 pnpm install
-pnpm run dev
-```
-
-そのあと `http://localhost:5374/` を開きます。
-
-Chrome で開くなら:
-
-```bash
-pnpm run open
+pnpm run cli -- chat vibe-local-pyodide --mode act
 ```
 
 ## Standalone command
@@ -95,28 +103,21 @@ pnpm link --global
 例:
 
 ```bash
-vibe-local-wasm dev
-vibe-local-wasm web
 vibe-local-wasm agentos
-vibe-local-wasm health
-vibe-local-wasm projects
 vibe-local-wasm chat vibe-local-pyodide --mode act
+vibe-local-wasm chat --list-sessions
+vibe-local-wasm --version
 ```
 
 ## Root scripts
 
 ```bash
-pnpm run dev
-pnpm run web
 pnpm run agentos
 pnpm run start:agentos
 pnpm run check
 pnpm run build
 pnpm run doctor
 pnpm run smoke
-pnpm run health
-pnpm run projects
-pnpm run open
 ```
 
 ## CLI commands
@@ -124,74 +125,49 @@ pnpm run open
 `vibe-local-wasm cli ...` または `pnpm run cli -- ...` で使えます。
 
 ```bash
-vibe-local-wasm cli health
-vibe-local-wasm cli projects
-vibe-local-wasm cli project-info vibe-local-pyodide
-vibe-local-wasm cli git-status
-vibe-local-wasm cli diff-stat
-vibe-local-wasm cli search localStorage 20
-vibe-local-wasm cli read-file README.md
-printf 'hello\n' | vibe-local-wasm cli write-file tools/agentos-dev/.agentos-dev/workspace/note.txt
-vibe-local-wasm cli run-script vibe-local-pyodide check
-vibe-local-wasm cli agent-run vibe-local-pyodide "git status を見て要約して"
-vibe-local-wasm cli agent-plan vibe-local-pyodide "README に改善点を出して"
-vibe-local-wasm cli agent-yolo vibe-local-pyodide "小さな UI 改善を最後までやって"
 vibe-local-wasm cli chat vibe-local-pyodide --mode act
-vibe-local-wasm cli sessions
-vibe-local-wasm cli session <sessionId>
-vibe-local-wasm cli watch-session <sessionId>
-vibe-local-wasm cli continue-session <sessionId>
-vibe-local-wasm cli continue-subagent <sessionId> <subAgentId>
-vibe-local-wasm cli approval <sessionId> <approvalId> <approve|reject> --continue
-vibe-local-wasm cli parallel-run --mode act vibe-local-pyodide "task 1" -- "task 2"
+pnpm run cli -- chat vibe-local-pyodide --mode plan
+pnpm run cli -- chat vibe-local-pyodide --prompt "Reply with exactly OK."
+pnpm run cli -- chat --resume --debug
+pnpm run cli -- chat --session-id 51d137c1 --debug
+pnpm run cli -- chat --list-sessions
+pnpm run cli -- --version
 ```
 
 interactive chat では次が使えます。
 
 - `/help`
-- `/mode <plan|act|yolo>`
-- `/projects`
-- `/project <name>`
-- `/approvals`
-- `/approve <id> [continue]`
-- `/reject <id>`
-- `/continue`
-- `/subagents`
-- `/continue-subagent <id>`
-- `/parallel [mode] <p1> -- <p2>`
-- `/session`
+- `/clear`
+- `/save`
+- `/status`
+- `/tokens`
+- `/config`
+- `/compact`
+- `/model <name>`
+- `/models`
+- `/plan`
+- `/approve`
+- `/yes`
+- `/diff`
+- `/git <args>`
+- `/commit`
+- `/undo`
+- `/checkpoint`
+- `/rollback`
+- `/autotest`
+- `/watch`
+- `/skills`
+- `/init`
 - `/exit`
-
-## Web UI behavior
-
-Web UI は chat-first です。
-
-- メイン画面は transcript と tool log が中心
-- settings panel は開閉でき、状態は localStorage に保存
-- backend settings は localStorage に保存
-- 会話本体と session 状態は actor-local SQLite に保存
-- selected session は必要時に詳細 hydrate される
-- running task / running sub-agent があると自動追従で再取得する
-
-Web から見える主要な操作:
-
-- session 作成
-- mode 切り替え
-- approval
-- compact
-- export
-- backend settings 保存
-- model 一覧取得
 
 ## Model/backend settings
 
-CLI の既定設定は `~/.config/opencode/config.json` から読みます。  
-Web は backend settings を localStorage に保存します。
+CLI の既定設定は `~/.config/opencode/config.json` から読みます。
 
 現状の前提:
 
 - OpenAI-compatible `/chat/completions` backend を使う
-- model 一覧取得が使える backend だと UI の model refresh が有効
+- model 一覧取得が使える backend だと `/models` が有効
 
 ## Persistence
 
@@ -204,12 +180,25 @@ Web は backend settings を localStorage に保存します。
 
 ランタイムはざっくり次の 3 層です。
 
+- `vibeLocal` actor
+  - trusted control plane
+  - sessions / messages / approvals / artifacts / sub-agents / task state を保持する
 - `workspaceVm`
+  - capability-oriented workspace surface
   - host toolkit と Pi を載せる
 - `codingSandbox`
-  - sandbox-agent を使う coding execution plane
-- `vibeLocal` actor
-  - sessions / messages / approvals / artifacts / sub-agents / task state を保持する
+  - Wasm では扱いづらい処理だけを逃がす external execution plane
+
+関連文書:
+
+- `docs/sandbox-contract.md`
+- `docs/mcp-layering.md`
+- `docs/workspace-model.md`
+- `docs/wasm-compat-mapping.md`
+
+## Archived web surface
+
+`vibe-local-pyodide/` には React + Vite ベースの Web UI 実装が残っていますが、現行の root workspace / root scripts / 検証導線は CLI-first です。Web 側は参照用・将来の整理対象として repo に残してあり、現フェーズではアクティブな提供面として扱っていません。
 
 ## Verification status
 
@@ -217,8 +206,7 @@ Web は backend settings を localStorage に保存します。
 
 - `pnpm run check`
 - `vibe-local-wasm help`
-- `vibe-local-wasm health`
-- `vibe-local-wasm projects`
+- `vibe-local-wasm chat vibe-local-pyodide --mode act`
 
 ## License
 

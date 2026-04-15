@@ -1,10 +1,41 @@
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { execSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+  watch,
+  writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline/promises";
 
-import { createAgentosClient, waitForManager, agentosEndpoint } from "./client.js";
+import { createClient } from "rivetkit/client";
+
+import { AGENTOS_PORT, REPO_ROOT } from "./config.js";
+import {
+  WATCH_IGNORED_DIRS as SHARED_WATCH_IGNORED_DIRS,
+  WATCH_IGNORED_EXTS as SHARED_WATCH_IGNORED_EXTS,
+} from "./shared/capability-policy.js";
+import { registry } from "./registry.js";
+import { runGit } from "./shared/git-utils.js";
+import {
+  FixedFooter,
+  bold,
+  cyan,
+  dim,
+  errorColor,
+  formatToolEvent,
+  gray,
+  green,
+  infoColor,
+  promptColor,
+  yellow,
+} from "./tui.js";
 
 type OpenCodeConfig = {
   provider?: Record<
@@ -19,16 +50,60 @@ type OpenCodeConfig = {
   >;
 };
 
+type AvailableModel = {
+  baseUrl: string;
+  displayName: string;
+  modelId: string;
+  providerId: string;
+};
+
 type BackendSettings = {
   apiKey: string;
   baseUrl: string;
+  contextWindow: number;
   maxTokens: number;
   model: string;
   systemPrompt: string;
   temperature: number;
 };
 
+type LoadedBackendConfig = {
+  configPath: string;
+  providers: Array<{
+    baseUrl: string;
+    id: string;
+    models: AvailableModel[];
+  }>;
+  settings: BackendSettings;
+};
+
 type SessionSnapshot = Awaited<ReturnType<Awaited<ReturnType<typeof getActor>>["exportSession"]>>;
+type SessionList = Awaited<ReturnType<Awaited<ReturnType<typeof getActor>>["hydrate"]>>;
+type SessionMode = "act" | "plan" | "yolo";
+
+type ChatCliOptions = {
+  contextWindow?: number;
+  debug: boolean;
+  listSessions: boolean;
+  maxTokens?: number;
+  mode?: SessionMode;
+  model?: string;
+  ollamaHost?: string;
+  project?: string;
+  prompt?: string;
+  resume: boolean;
+  sessionId?: string;
+  temperature?: number;
+  version: boolean;
+  yes: boolean;
+};
+
+type ResolvedChatSession = {
+  mode: SessionMode;
+  project: string;
+  sessionId: string;
+  snapshot: NonNullable<SessionSnapshot>;
+};
 
 function summarizeCliToolInput(input: Record<string, unknown>) {
   const entries = Object.entries(input);
@@ -42,56 +117,31 @@ function summarizeCliToolInput(input: Record<string, unknown>) {
     .join(" ");
 }
 
-function formatCliToolEvent(payload: Record<string, unknown>) {
-  const name = typeof payload.name === "string" ? payload.name : "unknown";
-  const input =
-    payload.input && typeof payload.input === "object" && !Array.isArray(payload.input)
-      ? (payload.input as Record<string, unknown>)
-      : {};
-  const status = typeof payload.status === "string" ? payload.status : "running";
-  return `[tool:${status}] ${name} ${summarizeCliToolInput(input)}`.trim();
-}
-
-function formatSubAgentLine(subAgent: NonNullable<SessionSnapshot>["subAgents"][number]) {
-  const pendingCount = subAgent.pendingApprovals.length;
-  return `[sub-agent:${subAgent.status}] ${subAgent.id} mode=${subAgent.executionMode} resumes=${subAgent.resumeCount} pending=${pendingCount} prompt=${subAgent.prompt}`;
-}
-
-function parseParallelPrompts(tokens: string[]) {
-  const chunks: string[] = [];
-  let current: string[] = [];
-  for (const token of tokens) {
-    if (token === "--") {
-      if (current.length > 0) {
-        chunks.push(current.join(" ").trim());
-        current = [];
-      }
-      continue;
-    }
-    current.push(token);
-  }
-  if (current.length > 0) {
-    chunks.push(current.join(" ").trim());
-  }
-  return chunks.filter(Boolean);
-}
-
 async function watchSessionProgress(
   actor: Awaited<ReturnType<typeof getActor>>,
   sessionId: string,
   work: Promise<unknown>,
+  footer?: FixedFooter,
 ) {
   let settled = false;
+  let workError: unknown = null;
   let lastAssistantText = "";
   const seenToolEvents = new Set<string>();
-  const seenSubAgentStates = new Map<string, string>();
 
-  void work.finally(() => {
+  work.catch((err) => { workError = err; }).finally(() => {
     settled = true;
   });
 
+  footer?.update({ status: "generating…" });
+
   while (!settled) {
-    const snapshot = (await actor.exportSession(sessionId)) as SessionSnapshot | null;
+    let snapshot: SessionSnapshot | null = null;
+    try {
+      snapshot = (await actor.exportSession(sessionId)) as SessionSnapshot | null;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      continue;
+    }
     if (snapshot) {
       const orderedArtifacts = [...snapshot.artifacts].sort(
         (left, right) =>
@@ -105,16 +155,14 @@ async function watchSessionProgress(
           continue;
         }
         seenToolEvents.add(artifact.id);
-        console.log(formatCliToolEvent(artifact.payload));
-      }
-
-      for (const subAgent of snapshot.subAgents) {
-        const signature = `${subAgent.status}:${subAgent.resumeCount}:${subAgent.pendingApprovals.join(",")}`;
-        if (seenSubAgentStates.get(subAgent.id) === signature) {
-          continue;
-        }
-        seenSubAgentStates.set(subAgent.id, signature);
-        console.log(formatSubAgentLine(subAgent));
+        const payload = artifact.payload as Record<string, unknown>;
+        const toolName = typeof payload.name === "string" ? payload.name : "unknown";
+        const toolStatus = typeof payload.status === "string" ? payload.status : "running";
+        const toolInput = payload.input && typeof payload.input === "object" && !Array.isArray(payload.input)
+          ? summarizeCliToolInput(payload.input as Record<string, unknown>)
+          : undefined;
+        console.log(formatToolEvent(toolName, toolStatus, toolInput));
+        footer?.update({ status: `tool: ${toolName}` });
       }
 
       const partialText = snapshot.task?.status === "running" ? snapshot.task.lastResponse ?? "" : "";
@@ -130,7 +178,12 @@ async function watchSessionProgress(
     await new Promise((resolve) => setTimeout(resolve, 350));
   }
 
-  const finalSnapshot = (await actor.exportSession(sessionId)) as SessionSnapshot | null;
+  let finalSnapshot: SessionSnapshot | null = null;
+  try {
+    finalSnapshot = (await actor.exportSession(sessionId)) as SessionSnapshot | null;
+  } catch {
+    // best-effort final read
+  }
   const finalText = finalSnapshot?.task?.lastResponse ?? "";
   if (finalText.startsWith(lastAssistantText) && finalText.length > lastAssistantText.length) {
     process.stdout.write(finalText.slice(lastAssistantText.length));
@@ -143,195 +196,788 @@ async function watchSessionProgress(
   if (lastAssistantText) {
     process.stdout.write("\n");
   }
+
+  footer?.update({ status: "idle" });
+
+  if (workError) {
+    throw workError;
+  }
 }
 
-async function watchExistingSession(
-  actor: Awaited<ReturnType<typeof getActor>>,
-  sessionId: string,
-  pollMs = 700,
-) {
-  let lastAssistantText = "";
-  const seenToolEvents = new Set<string>();
-  const seenSubAgentStates = new Map<string, string>();
+type FileChangeEvent = {
+  eventType: "change" | "rename";
+  filePath: string;
+  timestamp: string;
+};
 
-  while (true) {
-    const snapshot = (await actor.exportSession(sessionId)) as SessionSnapshot | null;
-    if (!snapshot) {
-      throw new Error(`Unknown session: ${sessionId}`);
-    }
+const WATCH_IGNORED_DIRS = SHARED_WATCH_IGNORED_DIRS as readonly string[];
+const WATCH_IGNORED_EXTS = SHARED_WATCH_IGNORED_EXTS as readonly string[];
+const RECURSIVE_WATCH_SUPPORTED = process.platform === "darwin" || process.platform === "win32";
 
-    const orderedArtifacts = [...snapshot.artifacts].sort(
-      (left, right) => new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime(),
-    );
-    for (const artifact of orderedArtifacts) {
-      if (artifact.kind !== "agent_tool_event" || seenToolEvents.has(artifact.id)) {
-        continue;
+function startFileWatcher(baseDir: string): {
+  drain: () => FileChangeEvent[];
+  stop: () => void;
+} {
+  const events: FileChangeEvent[] = [];
+  let active = true;
+  const options: { recursive: boolean } | { recursive: true } = RECURSIVE_WATCH_SUPPORTED
+    ? { recursive: true }
+    : { recursive: false as boolean };
+
+  try {
+    const watcher = watch(baseDir, options, (eventType, filename) => {
+      if (!active || !filename) return;
+      const filePath = filename.replace(/\\/g, "/");
+      if (WATCH_IGNORED_DIRS.some((d) => filePath.includes(`/${d}/`) || filePath.startsWith(`${d}/`))) return;
+      if (WATCH_IGNORED_EXTS.some((ext) => filePath.endsWith(ext))) return;
+      events.push({
+        eventType: eventType === "rename" ? "rename" : "change",
+        filePath,
+        timestamp: new Date().toISOString(),
+      });
+    });
+    return {
+      drain: () => {
+        const snapshot = [...events];
+        events.length = 0;
+        return snapshot;
+      },
+      stop: () => {
+        active = false;
+        try { watcher.close(); } catch { /* already closed */ }
+      },
+    };
+  } catch {
+    return {
+      drain: () => {
+        const snapshot = [...events];
+        events.length = 0;
+        return snapshot;
+      },
+      stop: () => { active = false; },
+    };
+  }
+}
+
+function resolveProjectDir(project: string): string {
+  const candidate = path.resolve(REPO_ROOT, project);
+  if (existsSync(candidate) && statSync(candidate).isDirectory()) {
+    return candidate;
+  }
+  return REPO_ROOT;
+}
+
+function detectTestCommand(projectDir: string): { cmd: string; type: string } | null {
+  const pkgPath = path.join(projectDir, "package.json");
+  if (existsSync(pkgPath)) {
+    try {
+      const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { scripts?: Record<string, string> };
+      if (pkg.scripts?.test && pkg.scripts.test !== "echo \"Error: no test specified\" && exit 1") {
+        return { cmd: "pnpm test", type: "pnpm" };
       }
-      seenToolEvents.add(artifact.id);
-      console.log(formatCliToolEvent(artifact.payload));
-    }
-
-    for (const subAgent of snapshot.subAgents) {
-      const signature = `${subAgent.status}:${subAgent.resumeCount}:${subAgent.pendingApprovals.join(",")}`;
-      if (seenSubAgentStates.get(subAgent.id) === signature) {
-        continue;
+      if (pkg.scripts?.["test:unit"]) {
+        return { cmd: "pnpm run test:unit", type: "pnpm" };
       }
-      seenSubAgentStates.set(subAgent.id, signature);
-      console.log(formatSubAgentLine(subAgent));
-    }
+    } catch { /* not valid JSON */ }
+  }
+  if (existsSync(path.join(projectDir, "pytest.ini")) || existsSync(path.join(projectDir, "pyproject.toml"))) {
+    return { cmd: "pytest", type: "pytest" };
+  }
+  if (existsSync(path.join(projectDir, "Cargo.toml"))) {
+    return { cmd: "cargo test", type: "cargo" };
+  }
+  return null;
+}
 
-    const currentText = snapshot.task?.lastResponse ?? "";
-    if (currentText.startsWith(lastAssistantText) && currentText.length > lastAssistantText.length) {
-      process.stdout.write(currentText.slice(lastAssistantText.length));
-      lastAssistantText = currentText;
-    } else if (currentText && currentText !== lastAssistantText) {
-      process.stdout.write(`\n${currentText}`);
-      lastAssistantText = currentText;
-    }
-
-    if (snapshot.task && snapshot.task.status !== "running") {
-      if (lastAssistantText) {
-        process.stdout.write("\n");
-      }
-      console.log(`[session] status=${snapshot.task.status}`);
-      printPendingApprovals(snapshot);
-      printSubAgentSummary(snapshot);
-      return;
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, pollMs));
+function runAutoTest(projectDir: string): { cmd: string; ok: boolean; output: string } | null {
+  const detected = detectTestCommand(projectDir);
+  if (!detected) return null;
+  const { cmd, type } = detected;
+  const binDir = type === "pnpm"
+    ? path.resolve(projectDir, "node_modules", ".bin")
+    : undefined;
+  const env: NodeJS.Dict<string> = {
+    ...process.env,
+    FORCE_COLOR: "0",
+    CI: "1",
+  };
+  if (binDir) {
+    env.PATH = `${binDir}:${process.env.PATH ?? ""}`;
+  }
+  try {
+    const stdout = execSync(cmd, {
+      cwd: projectDir,
+      encoding: "utf8",
+      env,
+      timeout: 60_000,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    return { ok: true, output: stdout.slice(-2000), cmd };
+  } catch (err: unknown) {
+    const e = err as { stdout?: string; stderr?: string; status?: number };
+    const combined = [e.stdout, e.stderr].filter(Boolean).join("\n").slice(-2000);
+    return { ok: false, output: combined || "test command failed", cmd };
   }
 }
 
 function usage() {
   console.log(`Usage:
-  pnpm vibe-local:cli health
-  pnpm vibe-local:cli projects
-  pnpm vibe-local:cli project-info <project>
-  pnpm vibe-local:cli git-status
-  pnpm vibe-local:cli diff-stat
-  pnpm vibe-local:cli search <query> [maxResults]
-  pnpm vibe-local:cli read-file <path>
-  pnpm vibe-local:cli read-agentfs-mirror <path>
-  pnpm vibe-local:cli write-file <path> < content.txt
-  pnpm vibe-local:cli run-script <project> <script> [timeoutMs]
-  pnpm vibe-local:cli agent-run <project> <prompt...>
-  pnpm vibe-local:cli agent-plan <project> <prompt...>
-  pnpm vibe-local:cli agent-yolo <project> <prompt...>
-  pnpm vibe-local:cli chat <project> [--mode plan|act|yolo]
-  pnpm vibe-local:cli sessions
-  pnpm vibe-local:cli session <sessionId>
-  pnpm vibe-local:cli watch-session <sessionId>
-  pnpm vibe-local:cli continue-session <sessionId>
-  pnpm vibe-local:cli continue-subagent <sessionId> <subAgentId>
-  pnpm vibe-local:cli approval <sessionId> <approvalId> <approve|reject> [--continue]
-  pnpm vibe-local:cli parallel-run [--mode read-only|act|plan|yolo] <project> <prompt1> -- <prompt2> [-- <prompt3>...]
-  pnpm vibe-local:cli agent-rewrite-file <project> <path> <prompt...>`);
+  pnpm run cli -- chat <project> [options]
+  pnpm run cli -- chat --resume [project] [options]
+  pnpm run cli -- chat --session-id <id> [project] [options]
+  pnpm run cli -- chat --list-sessions
+
+Options:
+  -p, --prompt <text>         Run one prompt and exit
+  -m, --model <name>          Override model
+  -y, --yes                   Enable YOLO/auto-approve mode
+      --debug                 Print resolved CLI settings
+      --resume                Resume the most recently updated session
+      --session-id <id>       Resume a specific session
+      --list-sessions         List saved sessions and exit
+      --ollama-host <url>     Override backend base URL
+      --max-tokens <n>        Override max output tokens
+      --temperature <n>       Override sampling temperature
+      --context-window <n>    Store the requested context window setting
+      --version               Print CLI version`);
+}
+
+let managerStarted = false;
+
+async function ensureManager() {
+  if (managerStarted) return;
+  registry.start();
+  managerStarted = true;
+  await new Promise((resolve) => setTimeout(resolve, 300));
 }
 
 async function getActor() {
-  const endpoint = agentosEndpoint();
-  await waitForManager(endpoint);
-  const client = createAgentosClient();
+  await ensureManager();
+  const endpoint = `http://127.0.0.1:${AGENTOS_PORT}`;
+  const client = createClient(endpoint) as any;
   return client.vibeLocal.getOrCreate(["browser-core"]);
 }
 
-function loadBackendSettings(): BackendSettings {
+function loadBackendConfig(): LoadedBackendConfig {
   const configPath = path.join(homedir(), ".config", "opencode", "config.json");
   if (!existsSync(configPath)) {
-    throw new Error(`OpenCode config was not found at ${configPath}`);
+    throw new Error(`OpenCode config not found at ${configPath}`);
   }
 
   const payload = JSON.parse(readFileSync(configPath, "utf8")) as OpenCodeConfig;
-  const providerEntries = Object.entries(payload.provider ?? {});
+  const providers = Object.entries(payload.provider ?? {}).map(([providerId, providerConfig]) => ({
+    baseUrl: providerConfig.options?.baseURL ?? "",
+    id: providerId,
+    models: Object.entries(providerConfig.models ?? {}).map(([modelId, modelConfig]) => ({
+      baseUrl: providerConfig.options?.baseURL ?? "",
+      displayName: modelConfig.name ?? modelId,
+      modelId,
+      providerId,
+    })),
+  }));
   const preferred =
-    providerEntries.find(([key]) => key === "qwen-local") ??
-    providerEntries.find(([, value]) => Object.keys(value.models ?? {}).length > 0) ??
+    providers.find((provider) => provider.id === "qwen-local" && provider.models.length > 0) ??
+    providers.find((provider) => provider.models.length > 0) ??
     null;
 
   if (!preferred) {
-    throw new Error("No OpenCode provider with models was found.");
-  }
-
-  const [providerName, providerConfig] = preferred;
-  const firstModelEntry = Object.entries(providerConfig.models ?? {})[0];
-  if (!firstModelEntry) {
-    throw new Error(`The selected OpenCode provider ${providerName} has no models.`);
+    throw new Error("No OpenCode provider with models found.");
   }
 
   return {
-    apiKey: providerConfig.options?.apiKey ?? "",
-    baseUrl: providerConfig.options?.baseURL ?? "",
-    model: firstModelEntry[0],
-    maxTokens: 4096,
-    systemPrompt: "You are the browser core of vibe-local. Be concise, careful, and helpful.",
-    temperature: 0.2,
+    configPath,
+    providers,
+    settings: {
+      apiKey:
+        payload.provider?.[preferred.id]?.options?.apiKey ?? "",
+      baseUrl: preferred.baseUrl,
+      contextWindow: 4096,
+      model: preferred.models[0]?.modelId ?? "",
+      maxTokens: 4096,
+      systemPrompt: "You are a helpful coding assistant. Be concise.",
+      temperature: 0.2,
+    },
   };
 }
 
-function printPendingApprovals(snapshot: SessionSnapshot | null) {
-  const approvals =
-    snapshot?.approvals.filter((approval: SessionSnapshot["approvals"][number]) => approval.status === "pending") ??
-    [];
-  if (approvals.length === 0) {
-    console.log("[approvals] pending approval はありません");
+function readCliVersion() {
+  const packageJsonPath = new URL("../../../package.json", import.meta.url);
+  const payload = JSON.parse(readFileSync(packageJsonPath, "utf8")) as { version?: string };
+  return payload.version ?? "0.0.0";
+}
+
+function parseIntegerFlag(value: string, flag: string) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`${flag} requires an integer.`);
+  }
+  return parsed;
+}
+
+function parseFloatFlag(value: string, flag: string) {
+  const parsed = Number.parseFloat(value);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`${flag} requires a number.`);
+  }
+  return parsed;
+}
+
+function parseChatArgs(args: string[]): ChatCliOptions {
+  const options: ChatCliOptions = {
+    debug: false,
+    listSessions: false,
+    resume: false,
+    version: false,
+    yes: false,
+  };
+
+  const positionals: string[] = [];
+
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index];
+    switch (token) {
+      case "--mode": {
+        const candidate = args[index + 1];
+        if (candidate !== "act" && candidate !== "plan" && candidate !== "yolo") {
+          throw new Error("chat --mode must be one of act, plan, or yolo");
+        }
+        options.mode = candidate;
+        index += 1;
+        break;
+      }
+      case "--prompt":
+      case "-p":
+        options.prompt = args[index + 1];
+        if (!options.prompt) {
+          throw new Error(`${token} requires a value.`);
+        }
+        index += 1;
+        break;
+      case "--model":
+      case "-m":
+        options.model = args[index + 1];
+        if (!options.model) {
+          throw new Error(`${token} requires a value.`);
+        }
+        index += 1;
+        break;
+      case "--yes":
+      case "-y":
+        options.yes = true;
+        break;
+      case "--debug":
+        options.debug = true;
+        break;
+      case "--resume":
+        options.resume = true;
+        break;
+      case "--session-id":
+        options.sessionId = args[index + 1];
+        if (!options.sessionId) {
+          throw new Error("--session-id requires a value.");
+        }
+        index += 1;
+        break;
+      case "--list-sessions":
+        options.listSessions = true;
+        break;
+      case "--ollama-host":
+        options.ollamaHost = args[index + 1];
+        if (!options.ollamaHost) {
+          throw new Error("--ollama-host requires a value.");
+        }
+        index += 1;
+        break;
+      case "--max-tokens":
+        if (!args[index + 1]) {
+          throw new Error("--max-tokens requires a value.");
+        }
+        options.maxTokens = parseIntegerFlag(args[index + 1], "--max-tokens");
+        index += 1;
+        break;
+      case "--temperature":
+        if (!args[index + 1]) {
+          throw new Error("--temperature requires a value.");
+        }
+        options.temperature = parseFloatFlag(args[index + 1], "--temperature");
+        index += 1;
+        break;
+      case "--context-window":
+        if (!args[index + 1]) {
+          throw new Error("--context-window requires a value.");
+        }
+        options.contextWindow = parseIntegerFlag(args[index + 1], "--context-window");
+        index += 1;
+        break;
+      case "--version":
+        options.version = true;
+        break;
+      default:
+        if (token.startsWith("-")) {
+          throw new Error(`Unknown option: ${token}`);
+        }
+        positionals.push(token);
+        break;
+    }
+  }
+
+  if (options.resume && options.sessionId) {
+    throw new Error("Use either --resume or --session-id, not both.");
+  }
+
+  if (positionals.length > 1) {
+    throw new Error(`Unexpected extra arguments: ${positionals.slice(1).join(" ")}`);
+  }
+
+  if (positionals[0]) {
+    options.project = positionals[0];
+  }
+
+  return options;
+}
+
+function applyFlagOverrides(settings: BackendSettings, options: ChatCliOptions): BackendSettings {
+  return {
+    ...settings,
+    baseUrl: options.ollamaHost ?? settings.baseUrl,
+    contextWindow: options.contextWindow ?? settings.contextWindow,
+    maxTokens: options.maxTokens ?? settings.maxTokens,
+    model: options.model ?? settings.model,
+    temperature: options.temperature ?? settings.temperature,
+  };
+}
+
+function stripReasoningTags(value: string) {
+  return value.replace(/<think>[\s\S]*?<\/think>\s*/g, "").trim();
+}
+
+function estimateTokens(text: string) {
+  return Math.ceil(text.length / 4);
+}
+
+function estimateSessionTokens(snapshot: NonNullable<SessionSnapshot>) {
+  const messageTokens = snapshot.messages.reduce(
+    (sum: number, message: NonNullable<SessionSnapshot>["messages"][number]) =>
+      sum + estimateTokens(message.content),
+    0,
+  );
+  const artifactTokens = snapshot.artifacts.reduce((sum: number, artifact: NonNullable<SessionSnapshot>["artifacts"][number]) => {
+    if (artifact.kind !== "compaction_summary") {
+      return sum;
+    }
+    const summary = typeof artifact.payload.summary === "string" ? artifact.payload.summary : "";
+    return sum + estimateTokens(summary);
+  }, 0);
+  const taskTokens = snapshot.task?.lastResponse ? estimateTokens(snapshot.task.lastResponse) : 0;
+  return messageTokens + artifactTokens + taskTokens;
+}
+
+function buildUsageBar(used: number, total: number) {
+  const width = 30;
+  const pct = total > 0 ? Math.min(Math.round((used / total) * 100), 100) : 0;
+  const filled = Math.round((pct / 100) * width);
+  return {
+    bar: `${"█".repeat(filled)}${"░".repeat(width - filled)}`,
+    pct,
+  };
+}
+
+function splitShellWords(inputText: string) {
+  const args: string[] = [];
+  let current = "";
+  let quote: "'" | "\"" | null = null;
+  let escaped = false;
+
+  for (const char of inputText) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+    if (char === "'" || char === "\"") {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) {
+        args.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += char;
+  }
+
+  if (escaped || quote) {
+    throw new Error("Unterminated quoted argument.");
+  }
+  if (current) {
+    args.push(current);
+  }
+  return args;
+}
+
+function isDangerousGitArg(arg: string) {
+  const normalized = arg.toLowerCase();
+  const exact = new Set(["-c"]);
+  const prefixes = [
+    "--exec-path",
+    "--upload-pack",
+    "--receive-pack",
+    "--config",
+    "--config-env",
+    "--git-dir",
+    "--work-tree",
+    "-c=",
+  ];
+  return exact.has(normalized) || prefixes.some((prefix) => normalized.startsWith(prefix));
+}
+
+function isCliPathInside(root: string, candidate: string) {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function validateCliAccessiblePath(raw: string, cwd = REPO_ROOT) {
+  if (!raw || /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw) || raw === "-") {
+    return;
+  }
+  if (
+    path.isAbsolute(raw) ||
+    raw === "." ||
+    raw === ".." ||
+    raw.startsWith("./") ||
+    raw.startsWith("../") ||
+    raw.includes("/")
+  ) {
+    const resolved = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(cwd, raw);
+    if (!isCliPathInside(REPO_ROOT, resolved) && !isCliPathInside("/tmp", resolved)) {
+      throw new Error(`Path outside execution root is not allowed: ${raw}`);
+    }
+  }
+}
+
+function validateCliGitArgs(args: string[]) {
+  let expectPath = false;
+  for (const arg of args) {
+    if (expectPath) {
+      validateCliAccessiblePath(arg);
+      expectPath = false;
+      continue;
+    }
+    if (arg === "-C" || arg === "--git-dir" || arg === "--work-tree") {
+      expectPath = true;
+      continue;
+    }
+    if (arg.startsWith("--git-dir=") || arg.startsWith("--work-tree=")) {
+      validateCliAccessiblePath(arg.split("=", 2)[1] ?? "");
+      continue;
+    }
+    validateCliAccessiblePath(arg);
+  }
+}
+
+function listSkillFiles(baseDir: string) {
+  if (!existsSync(baseDir)) {
+    return [] as Array<{ lines: number; name: string; path: string }>;
+  }
+
+  const entries = readdirSync(baseDir, { withFileTypes: true });
+  const results: Array<{ lines: number; name: string; path: string }> = [];
+  for (const entry of entries) {
+    if (entry.isFile() && entry.name.endsWith(".md")) {
+      const fullPath = path.join(baseDir, entry.name);
+      const lines = readFileSync(fullPath, "utf8").split("\n").length;
+      results.push({ lines, name: entry.name.replace(/\.md$/, ""), path: fullPath });
+      continue;
+    }
+    if (entry.isDirectory()) {
+      const skillPath = path.join(baseDir, entry.name, "SKILL.md");
+      if (existsSync(skillPath) && statSync(skillPath).isFile()) {
+        const lines = readFileSync(skillPath, "utf8").split("\n").length;
+        results.push({ lines, name: entry.name, path: skillPath });
+      }
+    }
+  }
+  return results;
+}
+
+async function generateCommitMessage(settings: BackendSettings, diffText: string) {
+  const endpoint = `${settings.baseUrl.replace(/\/$/, "")}/chat/completions`;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(settings.apiKey ? { Authorization: `Bearer ${settings.apiKey}` } : {}),
+    },
+    body: JSON.stringify({
+      max_tokens: Math.min(settings.maxTokens, 400),
+      messages: [
+        {
+          content:
+            "You are a commit message generator. Given a git diff, write a concise conventional commit message. Use format: <type>: <description>. Keep the first line under 72 characters. Add a blank line and bullet points only if needed. Output only the commit message.",
+          role: "system",
+        },
+        {
+          content: `Generate a commit message for this diff:\n\n${diffText}`,
+          role: "user",
+        },
+      ],
+      model: settings.model,
+      stream: false,
+      temperature: Math.min(settings.temperature, 0.3),
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`commit message generation failed: ${response.status} ${response.statusText}`);
+  }
+
+  const payload = (await response.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const message = stripReasoningTags(payload.choices?.[0]?.message?.content ?? "");
+  if (!message) {
+    throw new Error("commit message generation returned an empty response.");
+  }
+  return message;
+}
+
+async function promptForCommitMessageOverride(
+  rl: ReturnType<typeof createInterface>,
+  proposedMessage: string,
+) {
+  const answer = (await rl.question(cyan("Commit with this message? [Y/n/e(dit)] "))).trim().toLowerCase();
+  if (answer === "n" || answer === "no") {
+    return null;
+  }
+  if (answer !== "e" && answer !== "edit") {
+    return proposedMessage;
+  }
+
+  console.log(dim("Enter a replacement commit message. Submit an empty line to finish."));
+  const lines: string[] = [];
+  while (true) {
+    const nextLine = await rl.question("");
+    if (!nextLine) {
+      break;
+    }
+    lines.push(nextLine);
+  }
+  const replacement = lines.join("\n").trim();
+  return replacement || null;
+}
+
+function resolveMode(options: ChatCliOptions, snapshot?: NonNullable<SessionSnapshot>): SessionMode {
+  if (options.yes) {
+    return "yolo";
+  }
+  return options.mode ?? snapshot?.session.mode ?? "act";
+}
+
+function resolveProjectFromSnapshot(snapshot: NonNullable<SessionSnapshot>, fallback?: string) {
+  return fallback ?? snapshot.task?.selectedProject ?? "";
+}
+
+async function listSessions(actor: Awaited<ReturnType<typeof getActor>>) {
+  const payload = (await actor.hydrate()) as SessionList;
+  if (payload.sessions.length === 0) {
+    console.log("No saved sessions.");
     return;
   }
 
-  console.log("[approvals]");
-  for (const approval of approvals) {
+  for (const snapshot of payload.sessions) {
+    const updatedAt = snapshot.session.updatedAt.replace("T", " ").replace(/\.\d+Z$/, "Z");
     console.log(
-      `- ${approval.id} ${approval.toolName} ${summarizeCliToolInput(
-        approval.input as Record<string, unknown>,
-      )}`,
+      [
+        snapshot.session.id.slice(0, 8),
+        snapshot.session.mode,
+        snapshot.session.model || "-",
+        updatedAt,
+        snapshot.session.title,
+      ].join("\t"),
     );
   }
 }
 
-function printSubAgentSummary(snapshot: SessionSnapshot | null) {
-  const subAgents = snapshot?.subAgents ?? [];
-  if (subAgents.length === 0) {
-    console.log("[sub-agents] まだありません");
-    return;
+async function findSessionByIdPrefix(
+  actor: Awaited<ReturnType<typeof getActor>>,
+  sessionId: string,
+) {
+  const exact = (await actor.exportSession(sessionId)) as SessionSnapshot | null;
+  if (exact) {
+    return exact;
   }
 
-  console.log("[sub-agents]");
-  for (const subAgent of subAgents) {
-    console.log(
-      `- ${subAgent.id} status=${subAgent.status} mode=${subAgent.executionMode} resumes=${subAgent.resumeCount} prompt=${subAgent.prompt}`,
-    );
-    if (subAgent.error) {
-      console.log(`  error: ${subAgent.error}`);
-    } else if (subAgent.finalResponse) {
-      const preview = subAgent.finalResponse.replace(/\s+/g, " ").slice(0, 120);
-      console.log(`  result: ${preview}`);
+  const payload = (await actor.hydrate()) as SessionList;
+  const matches = payload.sessions.filter(
+    (snapshot: SessionList["sessions"][number]) => snapshot.session.id.startsWith(sessionId),
+  );
+  if (matches.length === 1) {
+    return matches[0];
+  }
+  if (matches.length > 1) {
+    throw new Error(`Session id prefix is ambiguous: ${sessionId}`);
+  }
+  return null;
+}
+
+async function resolveChatSession(
+  actor: Awaited<ReturnType<typeof getActor>>,
+  options: ChatCliOptions,
+  settings: BackendSettings,
+): Promise<ResolvedChatSession> {
+  const mode = resolveMode(options);
+
+  if (options.sessionId) {
+    const snapshot = await findSessionByIdPrefix(actor, options.sessionId);
+    if (!snapshot) {
+      throw new Error(`Unknown session: ${options.sessionId}`);
     }
+    const project = resolveProjectFromSnapshot(snapshot, options.project);
+    if (!project) {
+      throw new Error("Missing <project> for this session. Pass a project argument explicitly.");
+    }
+    const nextMode = resolveMode(options, snapshot);
+    const nextModel = options.model ?? snapshot.session.model ?? settings.model;
+    await actor.setSessionConfig(snapshot.session.id, nextModel, nextMode);
+    const refreshed = (await actor.exportSession(snapshot.session.id)) as SessionSnapshot | null;
+    if (!refreshed) {
+      throw new Error(`Unknown session: ${options.sessionId}`);
+    }
+    return {
+      mode: nextMode,
+      project,
+      sessionId: refreshed.session.id,
+      snapshot: refreshed,
+    };
+  }
+
+  if (options.resume) {
+    const payload = (await actor.hydrate()) as SessionList;
+    const latest = payload.sessions[0] ?? null;
+    if (!latest) {
+      throw new Error("No saved sessions found.");
+    }
+    const project = resolveProjectFromSnapshot(latest, options.project);
+    if (!project) {
+      throw new Error("Missing <project> for the resumed session. Pass a project argument explicitly.");
+    }
+    const nextMode = resolveMode(options, latest);
+    const nextModel = options.model ?? latest.session.model ?? settings.model;
+    await actor.setSessionConfig(latest.session.id, nextModel, nextMode);
+    const refreshed = (await actor.exportSession(latest.session.id)) as SessionSnapshot | null;
+    if (!refreshed) {
+      throw new Error(`Unknown session: ${latest.session.id}`);
+    }
+    return {
+      mode: nextMode,
+      project,
+      sessionId: refreshed.session.id,
+      snapshot: refreshed,
+    };
+  }
+
+  if (!options.project) {
+    throw new Error("Missing <project>");
+  }
+
+  const created = await actor.createSession(`CLI chat ${options.project}`);
+  await actor.setSessionConfig(created.session.id, settings.model, mode);
+  const snapshot = (await actor.exportSession(created.session.id)) as SessionSnapshot | null;
+  if (!snapshot) {
+    throw new Error(`Unknown session: ${created.session.id}`);
+  }
+  return {
+    mode,
+    project: options.project,
+    sessionId: snapshot.session.id,
+    snapshot,
+  };
+}
+
+function printDebugSummary(options: ChatCliOptions, resolved: ResolvedChatSession, settings: BackendSettings) {
+  console.log(dim("[debug] resolved chat options"));
+  console.log(
+    JSON.stringify(
+      {
+        contextWindow: settings.contextWindow,
+        maxTokens: settings.maxTokens,
+        mode: resolved.mode,
+        model: settings.model,
+        ollamaHost: settings.baseUrl,
+        project: resolved.project,
+        prompt: options.prompt ?? null,
+        resume: options.resume,
+        sessionId: resolved.sessionId,
+        temperature: settings.temperature,
+        yes: options.yes,
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+async function runSinglePrompt(
+  actor: Awaited<ReturnType<typeof getActor>>,
+  sessionId: string,
+  prompt: string,
+  settings: BackendSettings,
+  project: string,
+) {
+  const runPromise = actor.runAgentTurn(sessionId, prompt, settings, project);
+  await watchSessionProgress(actor, sessionId, runPromise);
+  const result = (await runPromise) as Record<string, unknown>;
+  if (result?.error && typeof result.error === "string") {
+    throw new Error(result.error);
   }
 }
 
 async function runInteractiveChat(
   actor: Awaited<ReturnType<typeof getActor>>,
+  sessionId: string,
   project: string,
-  initialMode: "act" | "plan" | "yolo",
+  initialMode: SessionMode,
+  settings: BackendSettings,
+  backendConfig: LoadedBackendConfig,
 ) {
-  const settings = loadBackendSettings();
-  const session = await actor.createSession(`CLI chat ${project}`);
   let mode = initialMode;
   let currentProject = project;
-  await actor.setSessionConfig(session.session.id, settings.model, mode);
-  const availableProjects = await actor.listProjects();
+  let checkpointRef: string | null = null;
+  let autoTestEnabled = false;
+  let watchEnabled = false;
+  let fileWatcher: { drain: () => FileChangeEvent[]; stop: () => void } | null = null;
+
+  const footer = new FixedFooter({
+    model: settings.model,
+    mode,
+    project: currentProject,
+    sessionId: sessionId.slice(0, 8),
+  });
+  footer.setup();
 
   const rl = createInterface({ input, output });
-  console.log(`[chat] session=${session.session.id} project=${currentProject} mode=${mode}`);
-  console.log(
-    "[chat] /help /mode <plan|act|yolo> /projects /project <name> /approvals /approve <id> [continue] /reject <id> /continue /subagents /continue-subagent <id> /parallel [mode] <p1> -- <p2> /session /exit",
-  );
+  console.log(infoColor(`session=${sessionId.slice(0, 8)} project=${currentProject} mode=${mode}`));
+  console.log(gray("Type a message or use /help for commands."));
 
   try {
     while (true) {
       let rawLine = "";
       try {
-        rawLine = await rl.question(`${mode}:${currentProject}> `);
+        rawLine = await rl.question(promptColor(`${mode}:${currentProject}> `));
       } catch (error) {
         if (error instanceof Error && error.message.includes("readline was closed")) {
           break;
@@ -348,184 +994,545 @@ async function runInteractiveChat(
       }
 
       if (line === "/help") {
-        console.log(
-          "[chat] 通常入力は agent 実行です。/mode /projects /project /approvals /approve /reject /continue /subagents /continue-subagent /parallel /session /exit が使えます。",
-        );
+        console.log(bold("Available commands:"));
+        console.log(`  ${cyan("/help")}          Show this help`);
+        console.log(`  ${cyan("/exit")}          Exit session`);
+        console.log(`  ${cyan("/clear")}         Clear conversation`);
+        console.log(`  ${cyan("/save")}          Export the current session snapshot`);
+        console.log(`  ${cyan("/plan")}          Enter Plan mode (read-only)`);
+        console.log(`  ${cyan("/approve")}       Switch to Act mode`);
+        console.log(`  ${cyan("/yes")}           Enable YOLO/auto-approve mode`);
+        console.log(`  ${cyan("/no")}            Return to Act mode from YOLO`);
+        console.log(`  ${cyan("/status")}        Show session info`);
+        console.log(`  ${cyan("/tokens")}        Show estimated context usage`);
+        console.log(`  ${cyan("/config")}        Show current CLI settings`);
+        console.log(`  ${cyan("/compact")}       Compress conversation history`);
+        console.log(`  ${cyan("/model")} ${gray("<name>")}  Switch model`);
+        console.log(`  ${cyan("/models")}         List configured models`);
+        console.log(`  ${cyan("/diff")}          Show git diff`);
+        console.log(`  ${cyan("/git")} ${gray("<args>")}   Run a git command`);
+        console.log(`  ${cyan("/commit")}        Draft a commit message and optionally commit`);
+        console.log(`  ${cyan("/undo")}          Remove the last conversation turn`);
+        console.log(`  ${cyan("/checkpoint")}    Save a tracked-files git checkpoint`);
+        console.log(`  ${cyan("/rollback")}      Restore the last checkpoint`);
+        console.log(`  ${cyan("/autotest")}      Toggle post-edit autotest (runs tests after file changes)`);
+        console.log(`  ${cyan("/watch")}         Toggle file watcher (reports external file changes)`);
+        console.log(`  ${cyan("/skills")}        List available skill files`);
+        console.log(`  ${cyan("/init")}          Create a CLAUDE.md template if missing`);
         continue;
       }
 
-      if (line.startsWith("/mode ")) {
-        const nextMode = line.slice("/mode ".length).trim();
-        if (nextMode !== "plan" && nextMode !== "act" && nextMode !== "yolo") {
-          console.log("[chat] mode は plan / act / yolo のみです");
+      if (line === "/clear") {
+        process.stdout.write("\x1b[2J\x1b[1;1H");
+        footer.setup();
+        console.log(infoColor("conversation display cleared"));
+        continue;
+      }
+
+      if (line === "/status") {
+        const snapshot = (await actor.exportSession(sessionId)) as SessionSnapshot | null;
+        const msgCount = snapshot?.messages.length ?? 0;
+        console.log(bold("Session Status:"));
+        console.log(`  ${gray("session")}  ${sessionId.slice(0, 8)}`);
+        console.log(`  ${gray("model")}    ${cyan(settings.model)}`);
+        console.log(`  ${gray("mode")}     ${mode}`);
+        console.log(`  ${gray("approve")}  ${mode === "yolo" ? "auto" : "prompted"}`);
+        console.log(`  ${gray("project")}  ${currentProject}`);
+        console.log(`  ${gray("messages")} ${msgCount}`);
+        console.log(`  ${gray("watch")}    ${watchEnabled ? "on" : "off"}`);
+        console.log(`  ${gray("autotest")} ${autoTestEnabled ? "on" : "off"}`);
+        if (snapshot?.task?.status) {
+          console.log(`  ${gray("task")}     ${snapshot.task.status}`);
+        }
+        continue;
+      }
+
+      if (line === "/tokens") {
+        const snapshot = (await actor.exportSession(sessionId)) as SessionSnapshot | null;
+        if (!snapshot) {
+          console.log(yellow("session snapshot unavailable"));
           continue;
         }
-        mode = nextMode;
-        await actor.setSessionConfig(session.session.id, settings.model, mode);
-        console.log(`[chat] mode を ${mode} に切り替えました`);
-        continue;
-      }
-
-      if (line === "/projects") {
-        console.log("[projects]");
-        for (const candidate of availableProjects) {
-          console.log(`- ${candidate.relativePath} (${candidate.name})`);
+        const used = estimateSessionTokens(snapshot);
+        const { bar, pct } = buildUsageBar(used, settings.contextWindow);
+        console.log(bold("Token Usage (estimated):"));
+        console.log(`  [${bar}] ${pct}%`);
+        console.log(`  ${used.toLocaleString()} / ${settings.contextWindow.toLocaleString()} tokens`);
+        console.log(`  ${snapshot.messages.length} messages in session`);
+        if (pct >= 80) {
+          console.log(yellow("Context is getting full. Use /compact if needed."));
         }
         continue;
       }
 
-      if (line.startsWith("/project ")) {
-        const nextProject = line.slice("/project ".length).trim();
-        if (!nextProject) {
-          console.log("[chat] /project <relativePath>");
+      if (line === "/config") {
+        console.log(bold("Configuration:"));
+        console.log(`  ${gray("model")}         ${settings.model}`);
+        console.log(`  ${gray("host")}          ${settings.baseUrl}`);
+        console.log(`  ${gray("temperature")}   ${settings.temperature}`);
+        console.log(`  ${gray("max tokens")}    ${settings.maxTokens}`);
+        console.log(`  ${gray("context")}       ${settings.contextWindow}`);
+        console.log(`  ${gray("auto-approve")}  ${mode === "yolo" ? "ON" : "OFF"}`);
+        console.log(`  ${gray("debug")}         ${process.env.AGENTOS_DEBUG ? "ON" : "OFF"}`);
+        console.log(`  ${gray("config path")}   ${backendConfig.configPath}`);
+        continue;
+      }
+
+      if (line === "/compact") {
+        try {
+          await actor.compactSession(sessionId);
+          console.log(infoColor("session compacted"));
+        } catch (err) {
+          console.log(errorColor(`compact failed: ${err instanceof Error ? err.message : String(err)}`));
+        }
+        continue;
+      }
+
+      if (line.startsWith("/model ")) {
+        const nextModel = line.slice("/model ".length).trim();
+        if (!nextModel) {
+          console.log(yellow("/model <name>"));
           continue;
         }
-        const exists = availableProjects.some(
-          (candidate: Awaited<ReturnType<typeof actor.listProjects>>[number]) =>
-            candidate.relativePath === nextProject,
-        );
-        if (!exists) {
-          console.log(`[chat] unknown project: ${nextProject}`);
+        settings.model = nextModel;
+        await actor.setSessionConfig(sessionId, settings.model, mode);
+        footer.update({ model: nextModel });
+        console.log(infoColor(`model → ${nextModel}`));
+        continue;
+      }
+
+      if (line === "/models") {
+        console.log(bold("Configured models:"));
+        for (const provider of backendConfig.providers) {
+          console.log(`  ${cyan(provider.id)}${provider.baseUrl ? gray(`  ${provider.baseUrl}`) : ""}`);
+          for (const model of provider.models) {
+            const marker = model.modelId === settings.model ? "*" : "-";
+            const label = model.displayName === model.modelId
+              ? model.modelId
+              : `${model.modelId} (${model.displayName})`;
+            console.log(`    ${marker} ${label}`);
+          }
+        }
+        continue;
+      }
+
+      if (line === "/save") {
+        const snapshot = (await actor.exportSession(sessionId)) as SessionSnapshot | null;
+        if (!snapshot) {
+          console.log(yellow("session snapshot unavailable"));
           continue;
         }
-        currentProject = nextProject;
-        console.log(`[chat] directory を ${currentProject} に切り替えました`);
+        const targetDir = path.join(REPO_ROOT, ".vibe-local", "sessions");
+        mkdirSync(targetDir, { recursive: true });
+        const targetPath = path.join(targetDir, `${sessionId}.json`);
+        writeFileSync(targetPath, JSON.stringify(snapshot, null, 2));
+        console.log(infoColor(`session exported → ${targetPath}`));
         continue;
       }
 
-      if (line === "/approvals") {
-        printPendingApprovals((await actor.exportSession(session.session.id)) as SessionSnapshot | null);
+      if (line === "/plan") {
+        mode = "plan";
+        await actor.setSessionConfig(sessionId, settings.model, mode);
+        footer.update({ mode });
+        console.log(infoColor(`mode → ${mode}`));
         continue;
       }
 
-      if (line === "/subagents") {
-        printSubAgentSummary((await actor.exportSession(session.session.id)) as SessionSnapshot | null);
+      if (line === "/approve" || line === "/act") {
+        mode = "act";
+        await actor.setSessionConfig(sessionId, settings.model, mode);
+        footer.update({ mode });
+        console.log(infoColor(`mode → ${mode}`));
         continue;
       }
 
-      if (line.startsWith("/continue-subagent ")) {
-        const subAgentId = line.slice("/continue-subagent ".length).trim();
-        if (!subAgentId) {
-          console.log("[chat] /continue-subagent <subAgentId>");
+      if (line === "/yes") {
+        mode = "yolo";
+        await actor.setSessionConfig(sessionId, settings.model, mode);
+        footer.update({ mode });
+        console.log(infoColor("auto-approve enabled"));
+        continue;
+      }
+
+      if (line === "/no") {
+        mode = "act";
+        await actor.setSessionConfig(sessionId, settings.model, mode);
+        footer.update({ mode });
+        console.log(infoColor("auto-approve disabled"));
+        continue;
+      }
+
+      if (line === "/diff") {
+        const unstaged = await runGit(["diff", "--color=always"]);
+        if (!unstaged.ok) {
+          console.log(errorColor(unstaged.stderr.trim() || "git diff failed"));
           continue;
         }
-        const actionPromise = actor.continueSubAgentTask(session.session.id, subAgentId, settings);
-        await watchSessionProgress(actor, session.session.id, actionPromise);
-        const result = await actionPromise;
-        console.log(`[sub-agent] ${result.subAgent.id} -> ${result.subAgent.status}`);
-        printSubAgentSummary((await actor.exportSession(session.session.id)) as SessionSnapshot | null);
-        continue;
-      }
-
-      if (line.startsWith("/parallel ")) {
-        const rawTokens = line.slice("/parallel ".length).trim().split(/\s+/).filter(Boolean);
-        let executionMode: "act" | "plan" | "read-only" | "yolo" = "read-only";
-        let normalizedTokens = rawTokens;
-        const modeCandidate = rawTokens[0];
-        if (
-          modeCandidate === "act" ||
-          modeCandidate === "plan" ||
-          modeCandidate === "read-only" ||
-          modeCandidate === "yolo"
-        ) {
-          executionMode = modeCandidate;
-          normalizedTokens = rawTokens.slice(1);
-        }
-        const prompts = parseParallelPrompts(normalizedTokens);
-        if (prompts.length === 0) {
-          console.log("[chat] /parallel [read-only|plan|act|yolo] <prompt1> -- <prompt2> [-- <prompt3>...]");
+        if (unstaged.stdout.trim()) {
+          process.stdout.write(unstaged.stdout.endsWith("\n") ? unstaged.stdout : `${unstaged.stdout}\n`);
           continue;
         }
-        const actionPromise = actor.runParallelAgentTasks(
-          session.session.id,
-          prompts,
-          settings,
-          currentProject,
-          executionMode,
-        );
-        await watchSessionProgress(actor, session.session.id, actionPromise);
-        const result = await actionPromise;
-        console.log(
-          `[parallel] started ${result.subAgents.length} sub-agents in ${executionMode} mode`,
-        );
-        printSubAgentSummary((await actor.exportSession(session.session.id)) as SessionSnapshot | null);
-        continue;
-      }
-
-      if (line === "/session") {
-        const snapshot = (await actor.exportSession(session.session.id)) as SessionSnapshot | null;
-        console.log(
-          JSON.stringify(
-            {
-              session: snapshot?.session,
-              task: snapshot?.task,
-              pendingApprovals:
-                snapshot?.approvals.filter(
-                  (approval: SessionSnapshot["approvals"][number]) => approval.status === "pending",
-                ) ?? [],
-              subAgents: snapshot?.subAgents ?? [],
-            },
-            null,
-            2,
-          ),
-        );
-        continue;
-      }
-
-      if (line === "/continue") {
-        const runPromise = actor.continueAgentTask(session.session.id, settings);
-        await watchSessionProgress(actor, session.session.id, runPromise);
-        const result = await runPromise;
-        console.log(`[task] status=${result.task?.status ?? "unknown"}`);
-        printPendingApprovals((await actor.exportSession(session.session.id)) as SessionSnapshot | null);
-        continue;
-      }
-
-      if (line.startsWith("/approve ")) {
-        const [approvalId, continueToken] = line
-          .slice("/approve ".length)
-          .trim()
-          .split(/\s+/);
-        if (!approvalId) {
-          console.log("[chat] /approve <approvalId> [continue]");
+        const staged = await runGit(["diff", "--cached", "--color=always"]);
+        if (!staged.ok) {
+          console.log(errorColor(staged.stderr.trim() || "git diff --cached failed"));
           continue;
         }
-        const continueAfter = continueToken === "continue";
-        const actionPromise = actor.approveToolCall(
-          session.session.id,
-          approvalId,
-          "approve",
-          continueAfter,
-          continueAfter ? settings : undefined,
-        );
-        if (continueAfter) {
-          await watchSessionProgress(actor, session.session.id, actionPromise);
+        if (staged.stdout.trim()) {
+          console.log(dim("(staged changes)"));
+          process.stdout.write(staged.stdout.endsWith("\n") ? staged.stdout : `${staged.stdout}\n`);
+        } else {
+          console.log(infoColor("No changes."));
         }
-        const result = await actionPromise;
-        console.log(`[approval] ${result.approval.toolName} -> ${result.approval.status}`);
-        printPendingApprovals((await actor.exportSession(session.session.id)) as SessionSnapshot | null);
         continue;
       }
 
-      if (line.startsWith("/reject ")) {
-        const approvalId = line.slice("/reject ".length).trim();
-        if (!approvalId) {
-          console.log("[chat] /reject <approvalId>");
+      if (line.startsWith("/git")) {
+        const rawArgs = line.slice("/git".length).trim();
+        if (!rawArgs) {
+          console.log(yellow("Usage: /git <command>"));
           continue;
         }
-        const result = await actor.approveToolCall(session.session.id, approvalId, "reject", false);
-        console.log(`[approval] ${result.approval.toolName} -> ${result.approval.status}`);
-        printPendingApprovals((await actor.exportSession(session.session.id)) as SessionSnapshot | null);
+        try {
+          const gitArgs = splitShellWords(rawArgs);
+          if (gitArgs.some(isDangerousGitArg)) {
+            console.log(errorColor("Blocked: /git does not allow -c, --config, or exec-path options."));
+            continue;
+          }
+          validateCliGitArgs(gitArgs);
+          const result = await runGit(gitArgs);
+          if (result.stdout) {
+            process.stdout.write(result.stdout.endsWith("\n") ? result.stdout : `${result.stdout}\n`);
+          }
+          if (result.stderr) {
+            process.stdout.write(yellow(result.stderr.endsWith("\n") ? result.stderr : `${result.stderr}\n`));
+          }
+          if (!result.ok && !result.stderr && !result.stdout) {
+            console.log(errorColor("git command failed"));
+          }
+        } catch (err) {
+          console.log(errorColor(`git error: ${err instanceof Error ? err.message : String(err)}`));
+        }
         continue;
       }
 
-      const runPromise = actor.runAgentTurn(session.session.id, line, settings, currentProject);
-      await watchSessionProgress(actor, session.session.id, runPromise);
-      const result = await runPromise;
-      console.log(`[task] status=${result.task.status}`);
-      printPendingApprovals((await actor.exportSession(session.session.id)) as SessionSnapshot | null);
+      if (line === "/commit") {
+        const status = await runGit(["status", "--porcelain"]);
+        if (!status.ok) {
+          console.log(errorColor(status.stderr.trim() || "Not a git repository."));
+          continue;
+        }
+        let staged = await runGit(["diff", "--cached", "--stat"]);
+        if (!staged.ok) {
+          console.log(errorColor(staged.stderr.trim() || "git diff --cached failed"));
+          continue;
+        }
+
+        if (!staged.stdout.trim()) {
+          if (!status.stdout.trim()) {
+            console.log(infoColor("Nothing to commit, working tree clean."));
+            continue;
+          }
+          let shouldStage = mode === "yolo";
+          if (!shouldStage) {
+            console.log(yellow("Nothing staged. Stage tracked file changes with git add -u?"));
+            console.log(dim(status.stdout.trim()));
+            const answer = (await rl.question(cyan("[y/N] "))).trim().toLowerCase();
+            shouldStage = answer === "y" || answer === "yes";
+          }
+          if (!shouldStage) {
+            console.log(yellow("Commit aborted."));
+            continue;
+          }
+          const addResult = await runGit(["add", "-u"]);
+          if (!addResult.ok) {
+            console.log(errorColor(addResult.stderr.trim() || "git add -u failed"));
+            continue;
+          }
+          staged = await runGit(["diff", "--cached", "--stat"]);
+          if (!staged.ok || !staged.stdout.trim()) {
+            console.log(yellow("No staged diff to commit."));
+            continue;
+          }
+        }
+
+        const diff = await runGit(["diff", "--cached"]);
+        if (!diff.ok || !diff.stdout.trim()) {
+          console.log(yellow("No diff to commit."));
+          continue;
+        }
+
+        try {
+          const proposed = await generateCommitMessage(settings, diff.stdout.slice(0, 4000));
+          console.log(`\n${bold("Proposed commit message:")}\n${proposed}\n`);
+          const finalMessage = mode === "yolo"
+            ? proposed
+            : await promptForCommitMessageOverride(rl, proposed);
+          if (!finalMessage) {
+            console.log(yellow("Commit aborted."));
+            continue;
+          }
+          const tempPath = path.join(tmpdir(), `vibe-local-commit-${process.pid}-${Date.now()}.txt`);
+          writeFileSync(tempPath, finalMessage);
+          try {
+            const commitResult = await runGit(["commit", "-F", tempPath]);
+            if (commitResult.ok) {
+              process.stdout.write(
+                commitResult.stdout.endsWith("\n") ? commitResult.stdout : `${commitResult.stdout}\n`,
+              );
+            } else {
+              console.log(errorColor("Commit failed:"));
+              if (commitResult.stderr) {
+                process.stdout.write(
+                  commitResult.stderr.endsWith("\n") ? commitResult.stderr : `${commitResult.stderr}\n`,
+                );
+              }
+            }
+          } finally {
+            unlinkSync(tempPath);
+          }
+        } catch (err) {
+          console.log(errorColor(`commit error: ${err instanceof Error ? err.message : String(err)}`));
+        }
+        continue;
+      }
+
+      if (line === "/undo") {
+        let confirmed = mode === "yolo";
+        if (!confirmed) {
+          const answer = (await rl.question(cyan("Remove last conversation turn? [y/N] ")))
+            .trim()
+            .toLowerCase();
+          confirmed = answer === "y" || answer === "yes";
+        }
+        if (!confirmed) {
+          console.log(yellow("Undo aborted."));
+          continue;
+        }
+        try {
+          const result = (await actor.undoLastTurn(sessionId)) as {
+            changed: boolean;
+            removedCount: number;
+            removedPreview?: string;
+            cascadeCounts?: { artifacts: number; approvals: number; subAgents: number; taskCleared: boolean };
+          };
+          if (result.changed) {
+            console.log(infoColor(`Removed ${result.removedCount} message(s) from the last turn.`));
+            if (result.cascadeCounts) {
+              const cc = result.cascadeCounts;
+              const parts: string[] = [];
+              if (cc.artifacts > 0) parts.push(`${cc.artifacts} artifact(s)`);
+              if (cc.approvals > 0) parts.push(`${cc.approvals} approval(s)`);
+              if (cc.subAgents > 0) parts.push(`${cc.subAgents} sub-agent(s)`);
+              if (cc.taskCleared) parts.push("task state");
+              if (parts.length > 0) {
+                console.log(dim(`  Also removed: ${parts.join(", ")}`));
+              }
+            }
+            if (result.removedPreview) {
+              const preview = result.removedPreview.split("\n").slice(0, 3).join("\n");
+              console.log(dim(preview));
+            }
+          } else {
+            console.log(yellow("Nothing to undo."));
+          }
+        } catch (err) {
+          console.log(errorColor(`undo failed: ${err instanceof Error ? err.message : String(err)}`));
+        }
+        continue;
+      }
+
+      if (line === "/checkpoint") {
+        const checkpoint = await runGit(["stash", "create", `cli-checkpoint-${sessionId.slice(0, 8)}`]);
+        if (!checkpoint.ok) {
+          console.log(errorColor(checkpoint.stderr.trim() || "checkpoint failed"));
+          continue;
+        }
+        const nextRef = checkpoint.stdout.trim();
+        if (!nextRef) {
+          console.log(yellow("No tracked changes to checkpoint."));
+          continue;
+        }
+        checkpointRef = nextRef;
+        console.log(infoColor(`checkpoint saved → ${checkpointRef.slice(0, 12)}`));
+        console.log(dim("Tracked file changes only. Use /rollback to restore this checkpoint."));
+        continue;
+      }
+
+      if (line === "/rollback") {
+        if (!checkpointRef) {
+          console.log(yellow("No checkpoint available."));
+          continue;
+        }
+        let confirmed = mode === "yolo";
+        if (!confirmed) {
+          const answer = (await rl.question(cyan("Rollback tracked files to the last checkpoint? [y/N] ")))
+            .trim()
+            .toLowerCase();
+          confirmed = answer === "y" || answer === "yes";
+        }
+        if (!confirmed) {
+          console.log(yellow("Rollback aborted."));
+          continue;
+        }
+        const reset = await runGit(["reset", "--hard", "HEAD"]);
+        if (!reset.ok) {
+          console.log(errorColor(reset.stderr.trim() || "git reset failed"));
+          continue;
+        }
+        const clean = await runGit(["clean", "-fd"]);
+        if (!clean.ok) {
+          console.log(errorColor(clean.stderr.trim() || "git clean failed"));
+          continue;
+        }
+        const apply = await runGit(["stash", "apply", "--index", checkpointRef]);
+        if (!apply.ok) {
+          console.log(errorColor(apply.stderr.trim() || "rollback failed"));
+          continue;
+        }
+        checkpointRef = null;
+        process.stdout.write(apply.stdout.endsWith("\n") ? apply.stdout : `${apply.stdout}\n`);
+        console.log(infoColor("rolled back to checkpoint"));
+        continue;
+      }
+
+      if (line === "/autotest") {
+        autoTestEnabled = !autoTestEnabled;
+        const projectDir = resolveProjectDir(currentProject);
+        console.log(`Auto-test: ${autoTestEnabled ? infoColor("ON") : errorColor("OFF")}`);
+        if (autoTestEnabled) {
+          const detected = detectTestCommand(projectDir);
+          if (detected) {
+            console.log(dim(`  Detected test command: ${detected.cmd} (${detected.type})`));
+            console.log(dim(`  Project directory: ${projectDir}`));
+          } else {
+            console.log(yellow("  No test command detected for this project. Tests will not run."));
+          }
+        }
+        continue;
+      }
+
+      if (line === "/watch") {
+        watchEnabled = !watchEnabled;
+        console.log(`File watcher: ${watchEnabled ? infoColor("ON") : errorColor("OFF")}`);
+        if (watchEnabled) {
+          const projectDir = resolveProjectDir(currentProject);
+          fileWatcher?.stop();
+          if (!RECURSIVE_WATCH_SUPPORTED) {
+            console.log(yellow("  WARNING: fs.watch recursive is not supported on this platform."));
+            console.log(yellow("  Only top-level directory changes will be detected. Subdirectory changes may be missed."));
+            console.log(dim(`  Monitoring: ${projectDir} (shallow)`));
+          } else {
+            console.log(dim(`  Watching: ${projectDir}`));
+          }
+          fileWatcher = startFileWatcher(projectDir);
+          console.log(dim("  External file changes will be reported when detected."));
+        } else {
+          fileWatcher?.stop();
+          fileWatcher = null;
+          console.log(dim("  File watcher stopped."));
+        }
+        continue;
+      }
+
+      if (line === "/skills") {
+        const skillFiles = [
+          ...listSkillFiles(path.join(homedir(), ".config", "vibe-local", "skills")),
+          ...listSkillFiles(path.join(REPO_ROOT, ".vibe-local", "skills")),
+        ].sort((left, right) => left.name.localeCompare(right.name));
+        if (skillFiles.length === 0) {
+          console.log(yellow("No skills loaded."));
+          continue;
+        }
+        console.log(bold("Loaded skills:"));
+        for (const skillFile of skillFiles) {
+          console.log(`  ${cyan(skillFile.name)} ${gray(`(${skillFile.lines} lines)`)}`);
+        }
+        continue;
+      }
+
+      if (line === "/init") {
+        const claudeMdPath = path.join(REPO_ROOT, "CLAUDE.md");
+        if (existsSync(claudeMdPath)) {
+          console.log(yellow("CLAUDE.md already exists in this directory."));
+          continue;
+        }
+        const projectName = path.basename(REPO_ROOT);
+        const content = [
+          `# ${projectName}`,
+          "",
+          "## Project Overview",
+          "",
+          "<!-- Describe the project here -->",
+          "",
+          "## Instructions for AI",
+          "",
+          "- Follow existing code style",
+          "- Write tests for new features",
+          "- Use absolute paths",
+          "",
+        ].join("\n");
+        writeFileSync(claudeMdPath, content);
+        console.log(infoColor(`Created ${claudeMdPath}`));
+        continue;
+      }
+
+      try {
+        const runPromise = actor.runAgentTurn(sessionId, line, settings, currentProject);
+        await watchSessionProgress(actor, sessionId, runPromise, footer);
+        const result = (await runPromise) as Record<string, unknown>;
+        if (result?.error && typeof result.error === "string") {
+          footer.update({ status: "error" });
+          console.log(errorColor(`agent error: ${result.error}`));
+        } else {
+          const taskStatus = (result?.task as Record<string, unknown>)?.status ?? "unknown";
+          console.log(dim(`task: ${taskStatus}`));
+        }
+
+        if (watchEnabled && fileWatcher) {
+          const changeEvents = fileWatcher.drain();
+          if (changeEvents.length > 0) {
+            const summary = changeEvents
+              .slice(0, 10)
+              .map((e) => `  ${e.eventType}: ${e.filePath}`)
+              .join("\n");
+            const overflow = changeEvents.length > 10 ? `\n  ... and ${changeEvents.length - 10} more` : "";
+            console.log(dim(`\nFile changes detected since last turn:`));
+            console.log(dim(`${summary}${overflow}`));
+          }
+        }
+
+        if (autoTestEnabled) {
+          const projectDir = resolveProjectDir(currentProject);
+          const detected = detectTestCommand(projectDir);
+          if (detected) {
+            console.log(dim(`Running auto-test: ${detected.cmd}`));
+            const testResult = runAutoTest(projectDir);
+            if (testResult) {
+              if (testResult.ok) {
+                console.log(green(`auto-test passed (${testResult.cmd})`));
+              } else {
+                console.log(errorColor(`auto-test failed (${testResult.cmd})`));
+                const lines = testResult.output.split("\n");
+                const tail = lines.slice(-8).join("\n");
+                if (tail) {
+                  console.log(dim(tail));
+                }
+              }
+            }
+          }
+        }
+      } catch (err) {
+        footer.update({ status: "error" });
+        const msg = err instanceof Error ? err.message : String(err);
+        console.log(errorColor(`agent error: ${msg}`));
+        if (msg.includes("Internal error") || msg.includes("internal_error")) {
+          console.log(yellow("hint: check backend settings with /status, or server logs with AGENTOS_DEBUG=1"));
+        }
+      }
     }
   } finally {
+    fileWatcher?.stop();
+    footer.teardown();
     rl.close();
   }
 }
@@ -534,284 +1541,59 @@ async function main() {
   const argv = process.argv.slice(2);
   const normalizedArgv = argv[0] === "--" ? argv.slice(1) : argv;
   const [command, ...args] = normalizedArgv;
+
   if (!command || command === "help" || command === "--help") {
     usage();
     return;
   }
 
-  const actor = await getActor();
+  if (command === "--version") {
+    console.log(readCliVersion());
+    return;
+  }
 
   switch (command) {
-    case "health": {
-      console.log(JSON.stringify(await actor.health(), null, 2));
-      return;
-    }
-    case "projects": {
-      console.log(JSON.stringify(await actor.listProjects(), null, 2));
-      return;
-    }
-    case "project-info": {
-      const project = args[0];
-      if (!project) throw new Error("Missing <project>");
-      console.log(JSON.stringify(await actor.projectInfo(project), null, 2));
-      return;
-    }
-    case "git-status": {
-      console.log(JSON.stringify(await actor.gitStatus(), null, 2));
-      return;
-    }
-    case "sessions": {
-      const payload = await actor.hydrate();
-      console.log(
-        JSON.stringify(
-          payload.sessions.map((entry: any) => ({
-            id: entry.session.id,
-            title: entry.session.title,
-            mode: entry.session.mode,
-            model: entry.session.model,
-            approvals: (entry.approvals ?? [])
-              .filter((approval: any) => approval.status === "pending")
-              .map((approval: any) => ({
-                id: approval.id,
-                toolName: approval.toolName,
-                subAgentId: approval.subAgentId ?? null,
-              })),
-            task: entry.task
-              ? {
-                  goal: entry.task.goal,
-                  status: entry.task.status,
-                  continueCount: entry.task.continueCount,
-                }
-              : null,
-          })),
-          null,
-          2,
-        ),
-      );
-      return;
-    }
-    case "session": {
-      const sessionId = args[0];
-      if (!sessionId) throw new Error("Missing <sessionId>");
-      console.log(JSON.stringify(await actor.exportSession(sessionId), null, 2));
-      return;
-    }
-    case "watch-session": {
-      const sessionId = args[0];
-      if (!sessionId) throw new Error("Missing <sessionId>");
-      await watchExistingSession(actor, sessionId);
-      return;
-    }
-    case "diff-stat": {
-      console.log(JSON.stringify(await actor.gitDiffStat(), null, 2));
-      return;
-    }
-    case "search": {
-      const query = args[0];
-      if (!query) throw new Error("Missing <query>");
-      const maxResults = Number.parseInt(args[1] ?? "20", 10);
-      console.log(JSON.stringify(await actor.searchCode(query, maxResults), null, 2));
-      return;
-    }
-    case "read-file": {
-      const filePath = args[0];
-      if (!filePath) throw new Error("Missing <path>");
-      console.log(JSON.stringify(await actor.readFile(filePath), null, 2));
-      return;
-    }
-    case "read-agentfs-mirror": {
-      const filePath = args[0];
-      if (!filePath) throw new Error("Missing <path>");
-      console.log(JSON.stringify(await actor.readAgentFsMirror(filePath), null, 2));
-      return;
-    }
-    case "write-file": {
-      const filePath = args[0];
-      if (!filePath) throw new Error("Missing <path>");
-      const content = readFileSync(0, "utf8");
-      console.log(JSON.stringify(await actor.writeFile(filePath, content), null, 2));
-      return;
-    }
-    case "run-script": {
-      const project = args[0];
-      const script = args[1];
-      if (!project || !script) throw new Error("Missing <project> or <script>");
-      const timeoutMs = Number.parseInt(args[2] ?? "120000", 10);
-      console.log(JSON.stringify(await actor.runScript(project, script, timeoutMs), null, 2));
-      return;
-    }
-    case "agent-run": {
-      const project = args[0];
-      const prompt = args.slice(1).join(" ").trim();
-      if (!project || !prompt) throw new Error("Missing <project> or <prompt...>");
-      const settings = loadBackendSettings();
-      const session = await actor.createSession(`CLI ${project}`);
-      await actor.setSessionConfig(session.session.id, settings.model, "act");
-      const runPromise = actor.runAgentTurn(session.session.id, prompt, settings, project);
-      await watchSessionProgress(actor, session.session.id, runPromise);
-      console.log(
-        JSON.stringify(
-          await runPromise,
-          null,
-          2,
-        ),
-      );
-      return;
-    }
     case "chat": {
-      const project = args[0];
-      if (!project) {
-        throw new Error("Missing <project>");
+      const options = parseChatArgs(args);
+      if (options.version) {
+        console.log(readCliVersion());
+        return;
       }
-      const modeIndex = args.findIndex((token) => token === "--mode");
-      let mode: "act" | "plan" | "yolo" = "act";
-      if (modeIndex >= 0) {
-        const candidate = args[modeIndex + 1];
-        if (candidate !== "act" && candidate !== "plan" && candidate !== "yolo") {
-          throw new Error("chat --mode must be one of act, plan, or yolo");
-        }
-        mode = candidate;
+      if (options.debug) {
+        process.env.AGENTOS_DEBUG = "1";
       }
-      await runInteractiveChat(actor, project, mode);
-      return;
-    }
-    case "continue-session": {
-      const sessionId = args[0];
-      if (!sessionId) throw new Error("Missing <sessionId>");
-      const settings = loadBackendSettings();
-      const runPromise = actor.continueAgentTask(sessionId, settings);
-      await watchSessionProgress(actor, sessionId, runPromise);
-      console.log(
-        JSON.stringify(
-          await runPromise,
-          null,
-          2,
-        ),
-      );
-      return;
-    }
-    case "continue-subagent": {
-      const sessionId = args[0];
-      const subAgentId = args[1];
-      if (!sessionId || !subAgentId) throw new Error("Missing <sessionId> or <subAgentId>");
-      const settings = loadBackendSettings();
-      console.log(
-        JSON.stringify(
-          await actor.continueSubAgentTask(sessionId, subAgentId, settings),
-          null,
-          2,
-        ),
-      );
-      return;
-    }
-    case "agent-plan": {
-      const project = args[0];
-      const prompt = args.slice(1).join(" ").trim();
-      if (!project || !prompt) throw new Error("Missing <project> or <prompt...>");
-      const settings = loadBackendSettings();
-      const session = await actor.createSession(`CLI ${project}`);
-      await actor.setSessionConfig(session.session.id, settings.model, "plan");
-      const runPromise = actor.runAgentTurn(session.session.id, prompt, settings, project);
-      await watchSessionProgress(actor, session.session.id, runPromise);
-      console.log(
-        JSON.stringify(
-          await runPromise,
-          null,
-          2,
-        ),
-      );
-      return;
-    }
-    case "agent-yolo": {
-      const project = args[0];
-      const prompt = args.slice(1).join(" ").trim();
-      if (!project || !prompt) throw new Error("Missing <project> or <prompt...>");
-      const settings = loadBackendSettings();
-      const session = await actor.createSession(`CLI ${project}`);
-      await actor.setSessionConfig(session.session.id, settings.model, "yolo");
-      const runPromise = actor.runAgentTurn(session.session.id, prompt, settings, project);
-      await watchSessionProgress(actor, session.session.id, runPromise);
-      console.log(
-        JSON.stringify(
-          await runPromise,
-          null,
-          2,
-        ),
-      );
-      return;
-    }
-    case "approval": {
-      const sessionId = args[0];
-      const approvalId = args[1];
-      const decision = args[2];
-      const continueAfter = args.includes("--continue");
-      if (!sessionId || !approvalId || (decision !== "approve" && decision !== "reject")) {
-        throw new Error("Usage: approval <sessionId> <approvalId> <approve|reject> [--continue]");
+
+      const actor = await getActor();
+
+      if (options.listSessions) {
+        await listSessions(actor);
+        process.exit(0);
+        return;
       }
-      const settings = continueAfter ? loadBackendSettings() : undefined;
-      const actionPromise = actor.approveToolCall(sessionId, approvalId, decision, continueAfter, settings);
-      if (continueAfter) {
-        await watchSessionProgress(actor, sessionId, actionPromise);
+
+      const backendConfig = loadBackendConfig();
+      const settings = applyFlagOverrides(backendConfig.settings, options);
+      const resolved = await resolveChatSession(actor, options, settings);
+
+      if (options.debug) {
+        printDebugSummary(options, resolved, settings);
       }
-      console.log(
-        JSON.stringify(await actionPromise, null, 2),
-      );
-      return;
-    }
-    case "parallel-run": {
-      const executionModeIndex = args.findIndex((token) => token === "--mode");
-      let executionMode: "act" | "plan" | "read-only" | "yolo" = "read-only";
-      let normalizedArgs = [...args];
-      if (executionModeIndex >= 0) {
-        const candidate = normalizedArgs[executionModeIndex + 1];
-        if (candidate !== "act" && candidate !== "plan" && candidate !== "read-only" && candidate !== "yolo") {
-          throw new Error("parallel-run --mode must be one of read-only, act, plan, or yolo");
-        }
-        executionMode = candidate;
-        normalizedArgs = normalizedArgs.filter((_, index) => index !== executionModeIndex && index !== executionModeIndex + 1);
+
+      if (options.prompt) {
+        await runSinglePrompt(actor, resolved.sessionId, options.prompt, settings, resolved.project);
+        process.exit(0);
+        return;
       }
-      const project = normalizedArgs[0];
-      const prompts = parseParallelPrompts(normalizedArgs.slice(1));
-      if (!project || prompts.length === 0) {
-        throw new Error("Usage: parallel-run [--mode read-only|act|plan|yolo] <project> <prompt1> -- <prompt2> [-- <prompt3>...]");
-      }
-      const settings = loadBackendSettings();
-      const session = await actor.createSession(`CLI parallel ${project}`);
-      await actor.setSessionConfig(session.session.id, settings.model, "act");
-      const actionPromise = actor.runParallelAgentTasks(
-        session.session.id,
-        prompts,
+
+      await runInteractiveChat(
+        actor,
+        resolved.sessionId,
+        resolved.project,
+        resolved.mode,
         settings,
-        project,
-        executionMode,
+        backendConfig,
       );
-      await watchSessionProgress(actor, session.session.id, actionPromise);
-      console.log(
-        JSON.stringify(
-          await actionPromise,
-          null,
-          2,
-        ),
-      );
-      return;
-    }
-    case "agent-rewrite-file": {
-      const project = args[0];
-      const filePath = args[1];
-      const prompt = args.slice(2).join(" ").trim();
-      if (!project || !filePath || !prompt) {
-        throw new Error("Missing <project>, <path>, or <prompt...>");
-      }
-      const settings = loadBackendSettings();
-      const session = await actor.createSession(`CLI ${project}`);
-      await actor.setSessionConfig(session.session.id, settings.model, "act");
-      console.log(
-        JSON.stringify(
-          await actor.rewriteFileWithAgent(session.session.id, filePath, prompt, settings, project),
-          null,
-          2,
-        ),
-      );
+      process.exit(0);
       return;
     }
     default:
@@ -821,5 +1603,5 @@ async function main() {
 
 main().catch((error) => {
   console.error(error);
-  process.exitCode = 1;
+  process.exit(1);
 });
