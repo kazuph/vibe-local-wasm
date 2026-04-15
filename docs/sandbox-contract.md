@@ -27,10 +27,16 @@ Only these classes should be handed to the external sandbox:
 - session state and transcript persistence
 - approvals and audit trail
 - tool routing and capability checks
-- structured file tools
-- structured web fetch / search
 - sub-agent orchestration
 - task state management
+
+## Keep in the workspace capability surface
+
+- repo inspection
+- bounded file read/write/edit
+- glob and grep under sandbox policy
+- structured web fetch / search
+- workspace scratch files
 
 ## Current implementation note
 

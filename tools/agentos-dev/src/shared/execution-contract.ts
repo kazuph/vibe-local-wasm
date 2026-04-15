@@ -16,9 +16,10 @@ export interface DelegatedOperationClass {
 
 export const CONTROL_PLANE_RESPONSIBILITIES = [
   "session state",
+  "transcript persistence",
   "approvals and audit",
   "tool routing",
-  "capability decisions",
+  "capability checks",
   "sub-agent orchestration",
   "structured task state",
 ] as const;

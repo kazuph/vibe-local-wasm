@@ -192,6 +192,7 @@ CLI の既定設定は `~/.config/opencode/config.json` から読みます。
 関連文書:
 
 - `docs/sandbox-contract.md`
+- `docs/workspace-model.md`
 - `docs/wasm-compat-mapping.md`
 
 ## Archived web surface

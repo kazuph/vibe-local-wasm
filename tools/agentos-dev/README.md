@@ -87,3 +87,4 @@ CLI からは同じ `vibeLocal` actor を直接叩き、会話・compact artifac
 - 旧 Web UI を使う場合は `vibe-local-pyodide` 側の Vite middleware からも同じ actor を叩けますが、現行の主経路は CLI です
 - browser 側の localStorage / sql.js は archived web surface の話で、CLI path では actor-local SQLite が主経路です
 - `tools/agentos-dev/.agentos-dev/workspace` は現状 host filesystem を正としているが、将来は capability-mediated workspace を厚くしていく方針です
+- workspace ownership の設計は `WORKSPACE_OWNERSHIP.md` と `../../docs/workspace-model.md` にまとめる
