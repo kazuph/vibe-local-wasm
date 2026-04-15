@@ -3,6 +3,55 @@
 This document is a handoff plan for a separate AI or engineer.  
 It is intentionally detailed and assumes no hidden chat context.
 
+## 0. Mandatory completion report via tmux
+
+When you finish an implementation slice, and especially when you finish the full requested work, you must report back to the manager pane via tmux.
+
+- **manager pane ID:** `%19`
+- use your own pane ID as the prefix in the report
+- the report must be a single line
+- include success/failure, touched area, and commit SHA when available
+
+### Step 1: get your own pane ID
+
+```bash
+MY_PANE_ID=$(tmux display-message -p -t "$TMUX_PANE" '#{pane_id}')
+echo "$MY_PANE_ID"
+```
+
+### Step 2: send the completion report to pane `%19`
+
+Send text and Enter separately.
+
+```bash
+MY_PANE_ID=$(tmux display-message -p -t "$TMUX_PANE" '#{pane_id}')
+tmux send-keys -t %19 "[${MY_PANE_ID}] 完了: <what changed> / <validation> / <commit-sha-or-no-commit>"
+sleep 0.5
+tmux send-keys -t %19 Enter
+```
+
+Example:
+
+```bash
+MY_PANE_ID=$(tmux display-message -p -t "$TMUX_PANE" '#{pane_id}')
+tmux send-keys -t %19 "[${MY_PANE_ID}] 完了: /watch 実装、pnpm run check/build/smoke 通過、commit abc1234"
+sleep 0.5
+tmux send-keys -t %19 Enter
+```
+
+### Step 3: if the manager needs to reply to you
+
+The manager can answer back to your pane with:
+
+```bash
+CHILD_PANE_ID=%42
+tmux send-keys -t "${CHILD_PANE_ID}" "[%19] 受領: 続けて次の作業に進んでください"
+sleep 0.5
+tmux send-keys -t "${CHILD_PANE_ID}" Enter
+```
+
+See also: `.plan/tmux-reporting-manual.md`
+
 ## 1. Core objective
 
 Move the repository toward this architecture:
@@ -211,6 +260,7 @@ For every phase-sized change:
 5. commit only after validation
 
 This repository already follows a phase discipline where **validation and commit are required for completion**.
+After that, send the tmux completion report to pane `%19`.
 
 ## 7. Repo files that matter most
 
@@ -241,6 +291,7 @@ This repository already follows a phase discipline where **validation and commit
 3. Prefer JS/actor-side integration over modifying vendored Python.
 4. Keep trust-boundary explanations in sync with code.
 5. When in doubt, preserve agentOS/Wasm ownership and make sandbox narrower, not wider.
+6. After finishing implementation and validation, report completion to pane `%19` via tmux.
 
 ## 9. Suggested immediate next task
 
