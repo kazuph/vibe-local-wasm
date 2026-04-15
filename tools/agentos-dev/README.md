@@ -67,6 +67,8 @@ CLI からは同じ `vibeLocal` actor を直接叩き、会話・compact artifac
 - virtual workspace model
 - MCP layering
 
+MCP の layering は `../../docs/mcp-layering.md` と `src/shared/mcp-contract.ts` に固定する。
+
 ## 環境変数
 
 - `AGENTOS_PORT`: Rivet manager の listen port。既定値 `6520`

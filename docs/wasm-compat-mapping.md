@@ -55,7 +55,7 @@
 | `Bash` | restricted execution path | keep as explicit escape hatch, not default architecture |
 | `NotebookEdit` / `Task*` / `AskUserQuestion` | JS bridge in control plane | keep in-core |
 | file watcher / auto-test | implemented with control-plane ownership | keep policy / audit in control plane, delegate heavy execution only when necessary |
-| MCP | not finished | likely sandbox execution with control-plane ownership |
+| MCP | typed contract for control-plane config + sandbox spawn | keep permissions/audit in control plane and process lifecycle in sandbox |
 
 ## 5. Design rules for future work
 

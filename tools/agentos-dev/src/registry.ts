@@ -28,6 +28,7 @@ import {
   describeExecutionContract,
   formatSandboxDelegationClasses,
 } from "./shared/execution-contract.js";
+import { describeMcpContract } from "./shared/mcp-contract.js";
 import { gitToolkit, repoToolkit } from "./toolkits.js";
 import { vibeLocalActor } from "./vibe-local-actor.js";
 
@@ -44,6 +45,7 @@ function formatRepoInstructions(): string {
     "When a project needs a full coding agent such as Codex or Claude Code, hand off to the codingSandbox actor instead of assuming the agent is installed inside agentOS.",
     "The codingSandbox actor is reserved for explicit delegated execution classes:",
     formatSandboxDelegationClasses(),
+    "MCP configuration and audit stay in the control plane, while future MCP server spawn belongs to the sandbox.",
     "Keep routing, approvals, configuration, and audit in the control plane.",
   ].join("\n");
 }
@@ -156,6 +158,7 @@ export async function describeRegistry() {
       workspace: VM_WORKSPACE_PATH,
     },
     executionContract: describeExecutionContract(),
+    mcpContract: describeMcpContract(),
     projects,
   };
 }

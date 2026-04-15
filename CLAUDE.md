@@ -201,6 +201,7 @@ CLI → vibeLocal actor → Pyodide runtime → agentOS Manager surfaces
 - **Execution modes**: Plan / Act（本家準拠）。YOLO は本家の `--yes` フラグに相当。
 - **Sandbox contract**: explicit delegated execution classes are documented in `docs/sandbox-contract.md`
 - **Current roadmap focus**: sandbox contract, virtual workspace evolution, MCP layering
+- **MCP layering**: configuration / permission / audit stay in the control plane; server spawn belongs to the sandbox
 
 ## Technology Stack
 
