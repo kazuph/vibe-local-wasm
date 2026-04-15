@@ -112,6 +112,8 @@ const BRACKETED_PASTE_ENABLE = "\x1b[?2004h";
 const BRACKETED_PASTE_DISABLE = "\x1b[?2004l";
 const KITTY_KEYBOARD_ENABLE = "\x1b[>1u";
 const KITTY_KEYBOARD_DISABLE = "\x1b[<u";
+const XTERM_MODIFY_OTHER_KEYS_ENABLE = "\x1b[>4;2m";
+const XTERM_MODIFY_OTHER_KEYS_DISABLE = "\x1b[>4;0m";
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
 const SHIFT_ENTER_SEQUENCES = ["\x1b[13;2u", "\x1b[27;2;13~", "\x1b\r", "\x1b\n"];
@@ -796,6 +798,21 @@ function askLineWithReadline(query: string) {
   return rl.question(query).finally(() => rl.close());
 }
 
+function readTmuxExtendedKeysMode() {
+  if (!process.env.TMUX) {
+    return null;
+  }
+  try {
+    const value = execSync("tmux show-options -s -v extended-keys", {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return value || null;
+  } catch {
+    return null;
+  }
+}
+
 function trimPartialTerminalSequence(value: string, token: string) {
   const maxLength = Math.min(token.length - 1, value.length);
   for (let size = maxLength; size > 0; size -= 1) {
@@ -1185,11 +1202,16 @@ async function runInteractiveChat(
 
   const askLine = (query: string) => askLineWithReadline(query);
   const kittyKeyboardEnabled = output.isTTY && input.isTTY;
+  const tmuxExtendedKeysMode = readTmuxExtendedKeysMode();
   if (kittyKeyboardEnabled) {
-    output.write(KITTY_KEYBOARD_ENABLE);
+    output.write(process.env.TMUX ? XTERM_MODIFY_OTHER_KEYS_ENABLE : KITTY_KEYBOARD_ENABLE);
   }
   console.log(infoColor(`session=${sessionId.slice(0, 8)} project=${currentProject} mode=${mode}`));
   console.log(gray("Type a message or use /help for commands. Enter sends; Shift+Enter and paste keep newlines."));
+  if (process.env.TMUX && tmuxExtendedKeysMode === "off") {
+    console.log(yellow("tmux extended-keys is off; Shift+Enter may behave like Enter."));
+    console.log(dim("Run: tmux set -s extended-keys on && tmux set -s extended-keys-format csi-u"));
+  }
 
   try {
     while (true) {
@@ -1757,7 +1779,7 @@ async function runInteractiveChat(
   } finally {
     fileWatcher?.stop();
     if (kittyKeyboardEnabled) {
-      output.write(KITTY_KEYBOARD_DISABLE);
+      output.write(process.env.TMUX ? XTERM_MODIFY_OTHER_KEYS_DISABLE : KITTY_KEYBOARD_DISABLE);
     }
     footer.teardown();
   }
