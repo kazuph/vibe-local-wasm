@@ -8,9 +8,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 本家 `vibe-local` は Python stdlib only の単一ファイル (`vibe-coder.py`, ~7400行) で Ollama と直接通信するコーディングエージェント。本リポジトリはそのコア機能を以下の上に再実装している:
 
-- **agentOS**: Rivet-based managed VM runtime for workspace virtualization and tool execution
+- **agentOS**: Trusted control plane for workspace virtualization, policy, auditing, and tool routing
 - **AgentFS**: Filesystem mirroring/audit layer backed by SQLite
-- **sandbox-agent**: Separate execution plane for coding agents
+- **sandbox-agent**: External execution plane for non-WASM / non-Workers-compatible tasks
 - **Pyodide (WASM)**: 本家 `vibe-coder.py` (~8200行) をそのまま WASM 上で実行（CLI `chat` の既定実行経路）
 - **sql.js (WASM)**: 旧 Web UI 側に残る browser persistence layer（現行の主経路ではない）
 
@@ -29,6 +29,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - バックエンドが agentOS + sandbox-agent（本家は Ollama 直接通信）
 - セッション永続化が actor-local SQLite（本家は JSONL）
 - 旧 Web UI 実装が repo には残るが、現行の主経路は CLI/TUI
+
+## Target architecture principle
+
+この repo の目標は **all-WASM を名目化することではなく、WASM/agentOS を trusted core にし、WASM で扱えない処理だけを外部 sandbox に出すこと** です。
+
+- **control plane (trusted core)**: agentOS actor, Pyodide runtime, policy, audit, session state, tool routing
+- **execution plane (less-trusted)**: `codingSandbox` などの外部 sandbox。Bash / subprocess / build / test / MCP server spawn のような非WASM処理を担当
+- **design rule**: 状態管理・認可・監査・オーケストレーションは agentOS 側に残し、sandbox には主導権を渡さない
 
 ## Pyodide ランタイム（実装済み）
 
@@ -138,13 +146,13 @@ pnpm run cli -- chat vibe-local-pyodide --mode act
 
 ```
 CLI → vibeLocal actor → Pyodide runtime → agentOS Manager surfaces
-                                 ├── workspaceVm (Pi + host toolkits)
-                                 └── codingSandbox (sandbox-agent :2568)
+                                 ├── workspaceVm (capability-oriented workspace surface)
+                                 └── codingSandbox (external execution plane for non-WASM tasks)
 ```
 
-- **vibeLocal actor**: Actor key `["browser-core"]` のまま使っているが、現在の主利用者は CLI。sessions / messages / approvals / artifacts / sub-agents / task state を SQLite に保存する。
-- **workspaceVm**: Mounts repo read-only at `/mnt/repo`, writable workspace at `/mnt/workspace`. Provides host toolkits (repo inspection, git, code search, script execution).
-- **codingSandbox**: Runs coding agents via `sandbox-agent` local provider.
+- **vibeLocal actor**: Actor key `["browser-core"]` のまま使っているが、現在の主利用者は CLI。trusted control plane として sessions / messages / approvals / artifacts / sub-agents / task state を SQLite に保存する。
+- **workspaceVm**: Mounts repo read-only at `/mnt/repo`, writable workspace at `/mnt/workspace`. Current capability surface for repo inspection, git, code search, and bounded script execution.
+- **codingSandbox**: Runs coding agents via `sandbox-agent` local provider. Use it only for work that cannot stay inside the Wasm / Workers-compatible core.
 
 ## Archived web integration
 
@@ -188,7 +196,8 @@ CLI → vibeLocal actor → Pyodide runtime → agentOS Manager surfaces
 
 - **本家準拠**: CLI/TUI のコマンド体系は ochyai/vibe-local に準拠。本家にない独自コマンドは追加しない。
 - **Actor-local SQLite for conversations**: 現行の CLI path では会話本体も設定読み出しも host/actor 側を主に使う。
-- **AgentFS is a mirror/audit layer**: Host filesystem is always the source of truth; AgentFS provides parallel tracking.
+- **Wasm-first control plane**: policy / audit / orchestration は agentOS + Pyodide 側に置き、非WASM処理だけを external sandbox に委譲する。
+- **AgentFS is a mirror/audit layer**: 現状は host filesystem が source of truth だが、長期的には capability-mediated workspace を厚くしていく。
 - **Execution modes**: Plan / Act（本家準拠）。YOLO は本家の `--yes` フラグに相当。
 - **本家で実装済みだがこちらで未実装**: file watcher, auto-test loop, MCP連携, `/undo`
 

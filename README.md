@@ -5,6 +5,24 @@
 本家 `vibe-local` は Python stdlib only の単一ファイル (`vibe-coder.py`) で Ollama と直接通信するコーディングエージェントです。  
 本リポジトリはそのコア機能を `agentOS + SQLite + sandbox-agent + AgentFS` の上に再実装し、バックエンドを WASM (Pyodide) 上でも動かせるようにすることを目指しています。現時点で主に整備されているのは **CLI/TUI path** です。
 
+## Architecture direction
+
+この repo の目標は **「全部を無理に Wasm に押し込む」ことではなく、Wasm/agentOS を trusted control plane にし、Wasm で動かない処理だけを外部 sandbox に委譲すること** です。
+
+- **Wasm / agentOS 側**
+  - セッション状態
+  - 認可と監査
+  - tool routing
+  - capability 判定
+  - 可能な範囲の file / web / structured tool execution
+- **外部 sandbox 側**
+  - Wasm / Workers では扱いづらい処理
+  - 任意 Bash / subprocess
+  - 言語ランタイム依存の build / test
+  - 将来の MCP server spawn など
+
+つまり、外部 sandbox は **execution plane** であり、主導権は常に agentOS / Wasm 側に残します。
+
 CLI/TUI の体験は本家 vibe-local に準拠します。本家にないコマンドや API は原則として実装しません。
 
 ## 現在の実装状況
@@ -30,7 +48,8 @@ CLI/TUI の体験は本家 vibe-local に準拠します。本家にないコマ
 
 - file watcher の actor loop 連携
 - auto-test loop の自動実行
-- checkpoint / rollback の完全な upstream parity
+- MCP 連携
+- `/undo`
 
 ## Repository layout
 
@@ -153,12 +172,14 @@ CLI の既定設定は `~/.config/opencode/config.json` から読みます。
 
 ランタイムはざっくり次の 3 層です。
 
+- `vibeLocal` actor
+  - trusted control plane
+  - sessions / messages / approvals / artifacts / sub-agents / task state を保持する
 - `workspaceVm`
+  - capability-oriented workspace surface
   - host toolkit と Pi を載せる
 - `codingSandbox`
-  - sandbox-agent を使う coding execution plane
-- `vibeLocal` actor
-  - sessions / messages / approvals / artifacts / sub-agents / task state を保持する
+  - Wasm では扱いづらい処理だけを逃がす external execution plane
 
 ## Archived web surface
 

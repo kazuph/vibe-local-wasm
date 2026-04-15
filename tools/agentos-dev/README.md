@@ -4,10 +4,17 @@
 
 ## 何をしているか
 
-- `workspaceVm`: `agentOS` 上で Pi と host toolkits を動かす高速な VM
-- `codingSandbox`: `sandbox-agent` を `local` provider 経由で起動する coding agent 実行面
-- `vibeLocal`: CLI と旧 Web UI の session / transcript を actor-local SQLite に保存する actor
+- `vibeLocal`: CLI と旧 Web UI の session / transcript を actor-local SQLite に保存する trusted control plane actor
+- `workspaceVm`: `agentOS` 上で Pi と capability-oriented host toolkits を動かす高速な VM
+- `codingSandbox`: `sandbox-agent` を `local` provider 経由で起動する external execution plane
 - repo 全体を `agentOS` に read-only mount し、host 側で project discovery と script 実行を補助
+
+## 設計原則
+
+- Wasm / agentOS 側が **control plane**
+- sandbox 側は **non-WASM task 用 execution plane**
+- 状態管理・認可・監査・ルーティングは agentOS 側から外に出さない
+- Bash / subprocess / build / test / MCP spawn のような非WASM処理だけを sandbox に送る
 
 ## 重要な前提
 
@@ -77,4 +84,4 @@ CLI からは同じ `vibeLocal` actor を直接叩き、会話・compact artifac
 - 保存テーブルは `sessions`, `messages`, `artifacts`
 - 旧 Web UI を使う場合は `vibe-local-pyodide` 側の Vite middleware からも同じ actor を叩けますが、現行の主経路は CLI です
 - browser 側の localStorage / sql.js は archived web surface の話で、CLI path では actor-local SQLite が主経路です
-- `tools/agentos-dev/.agentos-dev/workspace` は引き続き host filesystem を正とし、AgentFS はその mirror / audit layer として並行保存します
+- `tools/agentos-dev/.agentos-dev/workspace` は現状 host filesystem を正としているが、将来は capability-mediated workspace を厚くしていく方針です
