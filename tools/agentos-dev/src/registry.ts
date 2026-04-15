@@ -24,6 +24,10 @@ import {
   toPosixPath,
 } from "./config.js";
 import { discoverProjects } from "./projects.js";
+import {
+  formatSandboxContractForInstructions,
+  getSandboxContractSummary,
+} from "./shared/sandbox-contract.js";
 import { gitToolkit, repoToolkit } from "./toolkits.js";
 import { vibeLocalActor } from "./vibe-local-actor.js";
 
@@ -38,6 +42,7 @@ function formatRepoInstructions(): string {
     `Pi global config is mounted at ${VM_PI_AGENT_PATH} and ${VM_PI_AGENT_ROOT_PATH}. It persists on the host at ${piHost}.`,
     "Prefer the host toolkits named repo and git for project discovery, script execution, and repository inspection.",
     "When a project needs a full coding agent such as Codex or Claude Code, hand off to the codingSandbox actor instead of assuming the agent is installed inside agentOS.",
+    formatSandboxContractForInstructions(),
   ].join("\n");
 }
 
@@ -144,6 +149,7 @@ export async function describeRegistry() {
       repo: VM_REPO_PATH,
       workspace: VM_WORKSPACE_PATH,
     },
+    sandboxContract: getSandboxContractSummary(),
     projects,
   };
 }

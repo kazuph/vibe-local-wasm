@@ -23,6 +23,8 @@
 
 つまり、外部 sandbox は **execution plane** であり、主導権は常に agentOS / Wasm 側に残します。
 
+明示的な委譲境界は `docs/sandbox-contract.md` にまとめています。
+
 CLI/TUI の体験は本家 vibe-local に準拠します。本家にないコマンドや API は原則として実装しません。
 
 ## 現在の実装状況
@@ -44,12 +46,11 @@ CLI/TUI の体験は本家 vibe-local に準拠します。本家にないコマ
   - actor-local SQLite persistence
   - JS bridge for `WebSearch` / `NotebookEdit` / `Task*` / `AskUserQuestion`
 
-後回しのままのもの:
+未完了のまま残っている主なもの:
 
-- file watcher の actor loop 連携
-- auto-test loop の自動実行
 - MCP 連携
-- `/undo`
+- より capability-native な workspace abstraction
+- sandbox 契約のさらなる狭域化
 
 ## Repository layout
 

@@ -145,6 +145,26 @@ After reliability work, move on to these:
 - targeted reproductions exist in `.artifacts/`
 - `pnpm run check`, `pnpm run build`, and relevant CLI reproductions pass
 
+### Review note: current blockers before marking Milestone 1 complete
+
+The following issues were found in a Milestone 1 review and should be fixed before this milestone is considered complete:
+
+1. **`/autotest` uses unresolved relative project paths**
+   - `detectTestCommand(currentProject)` and `runAutoTest(currentProject)` should resolve from `REPO_ROOT`, matching the `/watch` path handling.
+   - Otherwise, autotest can silently mis-detect or no-op when the CLI is launched outside the repo root.
+2. **`/watch` silently degrades on Linux**
+   - `fs.watch(..., { recursive: true })` is not supported on Linux.
+   - The current catch-and-fallback path returns a dead watcher without surfacing the limitation, so the UI can report `watch ON` while nothing is actually monitored.
+3. **`/undo` only removes messages, not full turn state**
+   - Removing only rows from `messages` leaves `artifacts`, `task_state`, approvals, and sub-agent traces from the undone turn.
+   - This breaks the expectation that `/undo` rolls back the last turn in an auditable, internally consistent way.
+4. **`/undo` currently clears `task_state` unconditionally**
+   - `artifacts`, `approvals`, and `sub_agents` are filtered by `createdAt >= lastUserTime`, but `task_state` is deleted whenever it exists.
+   - Because `task_state` is one row per session, this can wipe an older task that predates the undone turn. Guard it with the same time boundary (`task.createdAt >= lastUserTime`) before deleting.
+5. **`/undo` rejects a single orphaned user message after a failed first turn**
+   - `persistMessage(..., \"user\", prompt)` happens before the agent run, so a failed first turn can leave `messages.length === 1`.
+   - The current guard `if (snapshot.messages.length < 2)` incorrectly blocks undo for that valid rollback target and leaves the orphaned message stuck in the session.
+
 ## Milestone 2 — make the file/tool surface more capability-native
 
 ### Scope
@@ -176,6 +196,20 @@ Reduce the “raw host bridge” feel of:
 - it is easier to explain which operations are in-core vs delegated
 - file access policy remains enforced
 - no regression in current CLI flows
+
+### Review note: remaining Milestone 2 follow-ups
+
+Current progress is good: a shared `src/shared/capability-policy.ts` now centralizes path sandboxing and validation primitives, and `pyodide-runtime.ts` has started consuming it. However, the milestone is not fully closed yet because:
+
+1. **`glob.ts` and `grep.ts` still accept unsandboxed `input.path`**
+   - `input.path` is currently consumed directly as the search root.
+   - That means these structured tools do not yet enforce the same capability boundary, even though the shared policy module is imported.
+2. **`notebook-edit.ts` may now allow `/tmp` paths where it previously rejected non-repo paths**
+   - If that expansion is intentional, the behavior and error messaging must be clarified.
+   - If not intentional, the new policy integration needs to preserve the original repo-only guard instead of falling through on `/tmp`.
+3. **`glob.ts` and `grep.ts` must use `repoRoot` as the sandbox boundary**
+   - The structured tools should not freeze their security boundary to `process.cwd()` at module load time.
+   - `resolveAccessPath(input.path, repoRoot, TMP_ROOT, repoRoot)` is the correct shape here so the allowed sandbox matches the actual repo/tool root passed by the caller.
 
 ## Milestone 3 — narrow the sandbox contract
 

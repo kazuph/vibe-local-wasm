@@ -3,6 +3,7 @@ import path from "node:path";
 
 import { AGENTOS_PORT, REPO_ROOT, SANDBOX_AGENT_PORT, TOOL_ROOT } from "./config.js";
 import { discoverProjects } from "./projects.js";
+import { SANDBOX_DELEGATION_CLASSES } from "./shared/sandbox-contract.js";
 
 async function exists(target: string) {
   try {
@@ -27,6 +28,9 @@ async function main() {
   console.log(`- tool root: ${TOOL_ROOT}`);
   console.log(`- manager port: ${AGENTOS_PORT}`);
   console.log(`- sandbox-agent port: ${SANDBOX_AGENT_PORT}`);
+  console.log(
+    `- sandbox delegation classes: ${SANDBOX_DELEGATION_CLASSES.map((entry) => entry.id).join(", ")}`,
+  );
   console.log(`- projects discovered: ${projects.length}`);
 
   for (const target of requiredPaths) {

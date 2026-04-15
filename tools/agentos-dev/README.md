@@ -15,6 +15,7 @@
 - sandbox 側は **non-WASM task 用 execution plane**
 - 状態管理・認可・監査・ルーティングは agentOS 側から外に出さない
 - Bash / subprocess / build / test / MCP spawn のような非WASM処理だけを sandbox に送る
+- その委譲クラスの一覧は `../../docs/sandbox-contract.md` と `src/shared/sandbox-contract.ts` を正とする
 
 ## 重要な前提
 
@@ -60,10 +61,10 @@ CLI からは同じ `vibeLocal` actor を直接叩き、会話・compact artifac
 
 - checkpoint / rollback
 
-次は後回しです。
+未完了のまま残っている主なものです。
 
-- file watcher
-- auto-test loop
+- MCP layering
+- より capability-native な workspace ownership
 
 ## 環境変数
 
