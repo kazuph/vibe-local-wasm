@@ -88,7 +88,6 @@ export async function editNotebook(
   // 1. Resolve to absolute path
   const absPath = path.resolve(repoRoot, input.path);
 
-  // 2. Validate path stays within repoRoot (no .. escapes)
   const relative = path.relative(repoRoot, absPath);
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
     return {

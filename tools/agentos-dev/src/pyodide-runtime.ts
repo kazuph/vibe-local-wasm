@@ -26,6 +26,23 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker, isMainThread, workerData } from "node:worker_threads";
 
 import { REPO_ROOT } from "./config.js";
+import {
+  BLOCKED_EXECUTABLES,
+  PATH_VALUE_FLAGS,
+  SYSTEM_EXEC_DIRS,
+  WATCH_IGNORED_DIRS,
+  WATCH_IGNORED_EXTS,
+  isAllowedAccessPath as sharedIsAllowedAccessPath,
+  isPathInside,
+  isSystemExecutablePath as sharedIsSystemExecutablePath,
+  looksLikeUrl,
+  resolveAccessPath as sharedResolveAccessPath,
+  resolveExecutable as sharedResolveExecutable,
+  stripHtmlTags as sharedStripHtmlTags,
+  truncateContent as sharedTruncateContent,
+  validateCommandArgs as sharedValidateCommandArgs,
+  validatePathLikeArg as sharedValidatePathLikeArg,
+} from "./shared/capability-policy.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -37,54 +54,18 @@ const SANDBOX_HOME = path.join(TMP_ROOT, "vibe-local-wasm-home");
 const SANDBOX_CONFIG_HOME = path.join(SANDBOX_HOME, ".config");
 const SANDBOX_CACHE_HOME = path.join(SANDBOX_HOME, ".cache");
 const SANDBOX_DATA_HOME = path.join(SANDBOX_HOME, ".local", "share");
-const SYSTEM_EXEC_DIRS = [
-  "/bin",
-  "/sbin",
-  "/usr/bin",
-  "/usr/sbin",
-  "/usr/libexec",
-  "/usr/local/bin",
-  "/opt/homebrew/bin",
-];
-const BLOCKED_EXECUTABLES = new Set([
-  "sh",
-  "bash",
-  "dash",
-  "zsh",
-  "fish",
-  "python",
-  "python3",
-  "node",
-  "nodejs",
-  "ruby",
-  "perl",
-  "php",
-  "lua",
-  "osascript",
-]);
-const PATH_VALUE_FLAGS = new Set(["-C", "--git-dir", "--work-tree", "--file", "--output", "--input"]);
 
 mkdirSync(SANDBOX_HOME, { recursive: true });
 mkdirSync(SANDBOX_CONFIG_HOME, { recursive: true });
 mkdirSync(SANDBOX_CACHE_HOME, { recursive: true });
 mkdirSync(SANDBOX_DATA_HOME, { recursive: true });
 
-function isPathInside(root: string, candidate: string) {
-  const relative = path.relative(root, candidate);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
 function isAllowedAccessPath(candidate: string) {
-  return isPathInside(EXECUTION_ROOT, candidate) || isPathInside(TMP_ROOT, candidate);
+  return sharedIsAllowedAccessPath(candidate, EXECUTION_ROOT, TMP_ROOT);
 }
 
 function resolveAccessPath(raw: string, baseDir = EXECUTION_ROOT) {
-  if (!raw) throw new Error("Empty path");
-  const absolute = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(baseDir, raw);
-  if (!isAllowedAccessPath(absolute)) {
-    throw new Error(`Path outside execution root is not allowed: ${raw}`);
-  }
-  return absolute;
+  return sharedResolveAccessPath(raw, EXECUTION_ROOT, TMP_ROOT, baseDir);
 }
 
 function resolveExecutionCwd(raw?: string) {
@@ -99,62 +80,19 @@ function resolveExecutionCwd(raw?: string) {
 }
 
 function isSystemExecutablePath(candidate: string) {
-  return SYSTEM_EXEC_DIRS.some((root) => isPathInside(root, candidate));
+  return sharedIsSystemExecutablePath(candidate);
 }
 
 function resolveExecutable(command: string, cwd: string) {
-  const executableName = path.basename(command);
-  if (BLOCKED_EXECUTABLES.has(executableName)) {
-    throw new Error(`Executable '${executableName}' is blocked by the access policy`);
-  }
-  if (!command.includes("/") && !path.isAbsolute(command)) {
-    return command;
-  }
-  const absolute = path.isAbsolute(command) ? path.resolve(command) : path.resolve(cwd, command);
-  if (!isAllowedAccessPath(absolute) && !isSystemExecutablePath(absolute)) {
-    throw new Error(`Executable outside execution root is not allowed: ${command}`);
-  }
-  return absolute;
-}
-
-function looksLikeUrl(value: string) {
-  return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(value);
+  return sharedResolveExecutable(command, cwd, EXECUTION_ROOT, TMP_ROOT);
 }
 
 function validatePathLikeArg(value: string, cwd: string) {
-  if (!value || value === "-" || looksLikeUrl(value)) {
-    return;
-  }
-  if (
-    path.isAbsolute(value) ||
-    value === "." ||
-    value === ".." ||
-    value.startsWith("./") ||
-    value.startsWith("../") ||
-    value.includes("/")
-  ) {
-    resolveAccessPath(value, cwd);
-  }
+  sharedValidatePathLikeArg(value, cwd, EXECUTION_ROOT, TMP_ROOT);
 }
 
 function validateCommandArgs(args: string[], cwd: string) {
-  let expectPathValue = false;
-  for (const arg of args) {
-    if (expectPathValue) {
-      validatePathLikeArg(arg, cwd);
-      expectPathValue = false;
-      continue;
-    }
-    if (PATH_VALUE_FLAGS.has(arg)) {
-      expectPathValue = true;
-      continue;
-    }
-    if (arg.startsWith("--git-dir=") || arg.startsWith("--work-tree=")) {
-      validatePathLikeArg(arg.split("=", 2)[1] ?? "", cwd);
-      continue;
-    }
-    validatePathLikeArg(arg, cwd);
-  }
+  sharedValidateCommandArgs(args, cwd, EXECUTION_ROOT, TMP_ROOT);
 }
 
 function splitCommand(command: string) {
@@ -252,18 +190,7 @@ function sleepSync(ms: number) {
 }
 
 function stripHtml(text: string) {
-  return text
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&#39;/gi, "'")
-    .replace(/&quot;/gi, '"')
-    .replace(/\s+/g, " ")
-    .trim();
+  return sharedStripHtmlTags(text);
 }
 
 function normalizeCharsetLabel(label: string | null | undefined) {
@@ -1033,7 +960,7 @@ function executeSubAgentAllowedTool(name: string, params: Record<string, unknown
 }
 
 function truncateContent(value: string, limit: number, suffix: string) {
-  return value.length > limit ? `${value.slice(0, limit)}${suffix}` : value;
+  return sharedTruncateContent(value, limit, suffix);
 }
 
 function runSubAgentLoop(

@@ -1,6 +1,13 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import path from "node:path";
 import { z } from "zod";
+
+import { resolveAccessPath } from "../shared/capability-policy.js";
+
+const SANDBOX_TMP_ROOT = path.resolve(
+  process.env.TMPDIR ?? process.env.TEMP ?? "/tmp",
+);
 
 const execFileAsync = promisify(execFile);
 
@@ -39,7 +46,23 @@ export async function runGrep(
   input: GrepInput,
   repoRoot: string
 ): Promise<GrepResult> {
-  const searchPath = input.path ?? repoRoot;
+  let searchPath: string;
+  if (input.path) {
+    try {
+      searchPath = resolveAccessPath(input.path, repoRoot, SANDBOX_TMP_ROOT, repoRoot);
+    } catch {
+      return {
+        ok: false,
+        pattern: input.pattern,
+        mode: input.output_mode,
+        matches: [],
+        truncated: false,
+        error: `Path "${input.path}" is outside the allowed sandbox`,
+      };
+    }
+  } else {
+    searchPath = repoRoot;
+  }
 
   const args: string[] = [];
 

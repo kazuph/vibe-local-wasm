@@ -2,6 +2,12 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 
+import { resolveAccessPath } from "../shared/capability-policy.js";
+
+const SANDBOX_TMP_ROOT = path.resolve(
+  process.env.TMPDIR ?? process.env.TEMP ?? "/tmp",
+);
+
 export const globInputSchema = z.object({
   pattern: z.string().min(1),
   path: z.string().optional(),
@@ -123,7 +129,22 @@ export async function runGlob(
   repoRoot: string
 ): Promise<GlobResult> {
   const { pattern, max_results } = input;
-  const searchBase = input.path ?? repoRoot;
+  let searchBase: string;
+  if (input.path) {
+    try {
+      searchBase = resolveAccessPath(input.path, repoRoot, SANDBOX_TMP_ROOT, repoRoot);
+    } catch {
+      return {
+        ok: false,
+        pattern,
+        matches: [],
+        truncated: false,
+        error: `Path "${input.path}" is outside the allowed sandbox`,
+      };
+    }
+  } else {
+    searchBase = repoRoot;
+  }
 
   let matcher: RegExp;
   try {

@@ -17,6 +17,10 @@ import { createInterface } from "node:readline/promises";
 import { createClient } from "rivetkit/client";
 
 import { AGENTOS_PORT, REPO_ROOT } from "./config.js";
+import {
+  WATCH_IGNORED_DIRS as SHARED_WATCH_IGNORED_DIRS,
+  WATCH_IGNORED_EXTS as SHARED_WATCH_IGNORED_EXTS,
+} from "./shared/capability-policy.js";
 import { registry } from "./registry.js";
 import { runGit } from "./shared/git-utils.js";
 import {
@@ -206,8 +210,8 @@ type FileChangeEvent = {
   timestamp: string;
 };
 
-const WATCH_IGNORED_DIRS = ["node_modules", ".git", ".vibe-local", "dist", ".agentos-dev"];
-const WATCH_IGNORED_EXTS = [".db", ".sqlite", ".sqlite3", ".log", ".tmp"];
+const WATCH_IGNORED_DIRS = SHARED_WATCH_IGNORED_DIRS as readonly string[];
+const WATCH_IGNORED_EXTS = SHARED_WATCH_IGNORED_EXTS as readonly string[];
 const RECURSIVE_WATCH_SUPPORTED = process.platform === "darwin" || process.platform === "win32";
 
 function startFileWatcher(baseDir: string): {
