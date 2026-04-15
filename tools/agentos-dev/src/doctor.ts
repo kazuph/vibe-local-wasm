@@ -3,7 +3,8 @@ import path from "node:path";
 
 import { AGENTOS_PORT, REPO_ROOT, SANDBOX_AGENT_PORT, TOOL_ROOT } from "./config.js";
 import { discoverProjects } from "./projects.js";
-import { SANDBOX_DELEGATION_CLASSES } from "./shared/sandbox-contract.js";
+import { SANDBOX_DELEGATION_CLASSES, describeExecutionContract } from "./shared/execution-contract.js";
+import { describeMcpContract } from "./shared/mcp-contract.js";
 
 async function exists(target: string) {
   try {
@@ -31,6 +32,12 @@ async function main() {
   console.log(
     `- sandbox delegation classes: ${SANDBOX_DELEGATION_CLASSES.map((entry) => entry.id).join(", ")}`,
   );
+  const executionContract = describeExecutionContract();
+  const mcpContract = describeMcpContract();
+  console.log(
+    `- execution planes: ${[executionContract.controlPlane.plane, executionContract.workspaceSurface.plane, executionContract.sandbox.plane].join(", ")}`,
+  );
+  console.log(`- MCP status: ${mcpContract.status}, spawn in ${mcpContract.executionPlane}`);
   console.log(`- projects discovered: ${projects.length}`);
 
   for (const target of requiredPaths) {

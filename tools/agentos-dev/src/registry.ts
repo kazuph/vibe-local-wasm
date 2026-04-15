@@ -29,6 +29,7 @@ import {
   formatSandboxDelegationClasses,
 } from "./shared/execution-contract.js";
 import { describeMcpContract } from "./shared/mcp-contract.js";
+import { describeWorkspaceContract } from "./shared/workspace-contract.js";
 import { gitToolkit, repoToolkit } from "./toolkits.js";
 import { vibeLocalActor } from "./vibe-local-actor.js";
 
@@ -158,6 +159,7 @@ export async function describeRegistry() {
       workspace: VM_WORKSPACE_PATH,
     },
     executionContract: describeExecutionContract(),
+    workspaceContract: describeWorkspaceContract(),
     mcpContract: describeMcpContract(),
     projects,
   };
