@@ -962,10 +962,15 @@ async function readChatDraft(prompt: string, fallbackAskLine: AskLine): Promise<
             finish(draft);
             return;
           }
-          if (pending[0] === "\r" || pending[0] === "\n") {
+          if (pending[0] === "\r") {
             pending = pending.slice(1);
             finish(draft);
             return;
+          }
+          if (pending[0] === "\n") {
+            pending = pending.slice(1);
+            appendText("\n");
+            continue;
           }
           if (pending[0] === "\u0003") {
             pending = pending.slice(1);
