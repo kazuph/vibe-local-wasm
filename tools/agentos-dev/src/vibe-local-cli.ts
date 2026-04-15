@@ -105,6 +105,15 @@ type ResolvedChatSession = {
   snapshot: NonNullable<SessionSnapshot>;
 };
 
+type AskLine = (query: string) => Promise<string>;
+
+const CSI = "\x1b[";
+const BRACKETED_PASTE_ENABLE = "\x1b[?2004h";
+const BRACKETED_PASTE_DISABLE = "\x1b[?2004l";
+const BRACKETED_PASTE_START = "\x1b[200~";
+const BRACKETED_PASTE_END = "\x1b[201~";
+const SHIFT_ENTER_SEQUENCES = ["\x1b[13;2u", "\x1b[27;2;13~", "\x1b\r", "\x1b\n"];
+
 function summarizeCliToolInput(input: Record<string, unknown>) {
   const entries = Object.entries(input);
   if (entries.length === 0) {
@@ -756,10 +765,10 @@ async function generateCommitMessage(settings: BackendSettings, diffText: string
 }
 
 async function promptForCommitMessageOverride(
-  rl: ReturnType<typeof createInterface>,
+  askLine: AskLine,
   proposedMessage: string,
 ) {
-  const answer = (await rl.question(cyan("Commit with this message? [Y/n/e(dit)] "))).trim().toLowerCase();
+  const answer = (await askLine(cyan("Commit with this message? [Y/n/e(dit)] "))).trim().toLowerCase();
   if (answer === "n" || answer === "no") {
     return null;
   }
@@ -770,7 +779,7 @@ async function promptForCommitMessageOverride(
   console.log(dim("Enter a replacement commit message. Submit an empty line to finish."));
   const lines: string[] = [];
   while (true) {
-    const nextLine = await rl.question("");
+    const nextLine = await askLine("");
     if (!nextLine) {
       break;
     }
@@ -778,6 +787,209 @@ async function promptForCommitMessageOverride(
   }
   const replacement = lines.join("\n").trim();
   return replacement || null;
+}
+
+function askLineWithReadline(query: string) {
+  const rl = createInterface({ input, output });
+  return rl.question(query).finally(() => rl.close());
+}
+
+function trimPartialTerminalSequence(value: string, token: string) {
+  const maxLength = Math.min(token.length - 1, value.length);
+  for (let size = maxLength; size > 0; size -= 1) {
+    if (token.startsWith(value.slice(-size))) {
+      return {
+        complete: value.slice(0, -size),
+        partial: value.slice(-size),
+      };
+    }
+  }
+  return { complete: value, partial: "" };
+}
+
+function consumeEscapeSequence(value: string) {
+  if (!value.startsWith("\x1b")) {
+    return 0;
+  }
+  if (value === "\x1b") {
+    return null;
+  }
+  if (value.startsWith("\x1b[")) {
+    const match = value.match(/^\x1b\[[0-9;?]*[@-~]/);
+    if (match) {
+      return match[0].length;
+    }
+    return null;
+  }
+  if (value.startsWith("\x1bO")) {
+    if (value.length >= 3) {
+      return 3;
+    }
+    return null;
+  }
+  return 1;
+}
+
+function renderChatDraft(prompt: string, draft: string, previousLineCount: number) {
+  const continuationPrompt = gray("| ");
+  const lines = draft.split("\n");
+  const renderedLines = lines.length === 0 ? [""] : lines;
+  let frame = "\r";
+
+  if (previousLineCount > 1) {
+    frame += `${CSI}${previousLineCount - 1}A`;
+  }
+  for (let index = 0; index < previousLineCount; index += 1) {
+    frame += `${CSI}2K`;
+    if (index < previousLineCount - 1) {
+      frame += `${CSI}1B`;
+    }
+  }
+  if (previousLineCount > 1) {
+    frame += `${CSI}${previousLineCount - 1}A`;
+  }
+  frame += "\r";
+  frame += renderedLines
+    .map((line, index) => `${index === 0 ? prompt : continuationPrompt}${line}`)
+    .join("\n");
+  output.write(frame);
+  return renderedLines.length;
+}
+
+function removeLastCharacter(value: string) {
+  const chars = Array.from(value);
+  chars.pop();
+  return chars.join("");
+}
+
+async function readChatDraft(prompt: string, fallbackAskLine: AskLine): Promise<string | null> {
+  if (!input.isTTY || typeof input.setRawMode !== "function") {
+    return fallbackAskLine(prompt);
+  }
+
+  return await new Promise<string | null>((resolve, reject) => {
+    let draft = "";
+    let renderedLineCount = 1;
+    let pending = "";
+    let pasteMode = false;
+    let settled = false;
+
+    const cleanup = () => {
+      output.write(`${BRACKETED_PASTE_DISABLE}\n`);
+      input.off("data", onData);
+      input.setRawMode(false);
+    };
+
+    const finish = (value: string | null) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+
+    const fail = (error: unknown) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+
+    const appendText = (text: string) => {
+      if (!text) {
+        return;
+      }
+      draft += text;
+      renderedLineCount = renderChatDraft(prompt, draft, renderedLineCount);
+    };
+
+    const onData = (chunk: Buffer) => {
+      try {
+        pending += chunk.toString("utf8");
+
+        while (pending.length > 0) {
+          if (pasteMode) {
+            const pasteEndIndex = pending.indexOf(BRACKETED_PASTE_END);
+            if (pasteEndIndex === -1) {
+              const { complete, partial } = trimPartialTerminalSequence(pending, BRACKETED_PASTE_END);
+              appendText(complete);
+              pending = partial;
+              return;
+            }
+            appendText(pending.slice(0, pasteEndIndex));
+            pending = pending.slice(pasteEndIndex + BRACKETED_PASTE_END.length);
+            pasteMode = false;
+            continue;
+          }
+
+          if (pending.startsWith(BRACKETED_PASTE_START)) {
+            pending = pending.slice(BRACKETED_PASTE_START.length);
+            pasteMode = true;
+            continue;
+          }
+
+          const shiftEnter = SHIFT_ENTER_SEQUENCES.find((sequence) => pending.startsWith(sequence));
+          if (shiftEnter) {
+            pending = pending.slice(shiftEnter.length);
+            appendText("\n");
+            continue;
+          }
+
+          if (pending.startsWith("\r\n")) {
+            pending = pending.slice(2);
+            finish(draft);
+            return;
+          }
+          if (pending[0] === "\r" || pending[0] === "\n") {
+            pending = pending.slice(1);
+            finish(draft);
+            return;
+          }
+          if (pending[0] === "\u0003") {
+            pending = pending.slice(1);
+            finish(null);
+            return;
+          }
+          if (pending[0] === "\u0004" && draft.length === 0) {
+            pending = pending.slice(1);
+            finish(null);
+            return;
+          }
+          if (pending[0] === "\u007f" || pending[0] === "\b") {
+            pending = pending.slice(1);
+            draft = removeLastCharacter(draft);
+            renderedLineCount = renderChatDraft(prompt, draft, renderedLineCount);
+            continue;
+          }
+          if (pending[0] === "\x1b") {
+            const consumed = consumeEscapeSequence(pending);
+            if (consumed === null) {
+              return;
+            }
+            pending = pending.slice(consumed);
+            continue;
+          }
+
+          appendText(pending[0]);
+          pending = pending.slice(1);
+        }
+      } catch (error) {
+        fail(error);
+      }
+    };
+
+    try {
+      input.setRawMode(true);
+      output.write(BRACKETED_PASTE_ENABLE);
+      renderedLineCount = renderChatDraft(prompt, draft, renderedLineCount);
+      input.on("data", onData);
+    } catch (error) {
+      fail(error);
+    }
+  });
 }
 
 function resolveMode(options: ChatCliOptions, snapshot?: NonNullable<SessionSnapshot>): SessionMode {
@@ -969,31 +1181,36 @@ async function runInteractiveChat(
   });
   footer.setup();
 
-  const rl = createInterface({ input, output });
+  const askLine = (query: string) => askLineWithReadline(query);
   console.log(infoColor(`session=${sessionId.slice(0, 8)} project=${currentProject} mode=${mode}`));
-  console.log(gray("Type a message or use /help for commands."));
+  console.log(gray("Type a message or use /help for commands. Enter sends; Shift+Enter and paste keep newlines."));
 
   try {
     while (true) {
       let rawLine = "";
       try {
-        rawLine = await rl.question(promptColor(`${mode}:${currentProject}> `));
-      } catch (error) {
-        if (error instanceof Error && error.message.includes("readline was closed")) {
+        const nextDraft = await readChatDraft(promptColor(`${mode}:${currentProject}> `), askLine);
+        if (nextDraft === null) {
           break;
         }
-        throw error;
+        rawLine = nextDraft;
+      } catch (error) {
+        if (!(error instanceof Error && error.message.includes("readline was closed"))) {
+          throw error;
+        }
+        break;
       }
-      const line = rawLine.trim();
-      if (!line) {
+      const trimmedLine = rawLine.trim();
+      const commandLine = rawLine.includes("\n") ? null : trimmedLine;
+      if (!trimmedLine) {
         continue;
       }
 
-      if (line === "/exit" || line === "/quit") {
+      if (commandLine === "/exit" || commandLine === "/quit") {
         break;
       }
 
-      if (line === "/help") {
+      if (commandLine === "/help") {
         console.log(bold("Available commands:"));
         console.log(`  ${cyan("/help")}          Show this help`);
         console.log(`  ${cyan("/exit")}          Exit session`);
@@ -1019,17 +1236,18 @@ async function runInteractiveChat(
         console.log(`  ${cyan("/watch")}         Toggle file watcher (reports external file changes)`);
         console.log(`  ${cyan("/skills")}        List available skill files`);
         console.log(`  ${cyan("/init")}          Create a CLAUDE.md template if missing`);
+        console.log(`  ${gray("input")}          Enter sends; Shift+Enter and bracketed paste insert newlines`);
         continue;
       }
 
-      if (line === "/clear") {
+      if (commandLine === "/clear") {
         process.stdout.write("\x1b[2J\x1b[1;1H");
         footer.setup();
         console.log(infoColor("conversation display cleared"));
         continue;
       }
 
-      if (line === "/status") {
+      if (commandLine === "/status") {
         const snapshot = (await actor.exportSession(sessionId)) as SessionSnapshot | null;
         const msgCount = snapshot?.messages.length ?? 0;
         console.log(bold("Session Status:"));
@@ -1047,7 +1265,7 @@ async function runInteractiveChat(
         continue;
       }
 
-      if (line === "/tokens") {
+      if (commandLine === "/tokens") {
         const snapshot = (await actor.exportSession(sessionId)) as SessionSnapshot | null;
         if (!snapshot) {
           console.log(yellow("session snapshot unavailable"));
@@ -1065,7 +1283,7 @@ async function runInteractiveChat(
         continue;
       }
 
-      if (line === "/config") {
+      if (commandLine === "/config") {
         console.log(bold("Configuration:"));
         console.log(`  ${gray("model")}         ${settings.model}`);
         console.log(`  ${gray("host")}          ${settings.baseUrl}`);
@@ -1078,7 +1296,7 @@ async function runInteractiveChat(
         continue;
       }
 
-      if (line === "/compact") {
+      if (commandLine === "/compact") {
         try {
           await actor.compactSession(sessionId);
           console.log(infoColor("session compacted"));
@@ -1088,8 +1306,8 @@ async function runInteractiveChat(
         continue;
       }
 
-      if (line.startsWith("/model ")) {
-        const nextModel = line.slice("/model ".length).trim();
+      if (commandLine?.startsWith("/model ")) {
+        const nextModel = commandLine.slice("/model ".length).trim();
         if (!nextModel) {
           console.log(yellow("/model <name>"));
           continue;
@@ -1101,7 +1319,7 @@ async function runInteractiveChat(
         continue;
       }
 
-      if (line === "/models") {
+      if (commandLine === "/models") {
         console.log(bold("Configured models:"));
         for (const provider of backendConfig.providers) {
           console.log(`  ${cyan(provider.id)}${provider.baseUrl ? gray(`  ${provider.baseUrl}`) : ""}`);
@@ -1116,7 +1334,7 @@ async function runInteractiveChat(
         continue;
       }
 
-      if (line === "/save") {
+      if (commandLine === "/save") {
         const snapshot = (await actor.exportSession(sessionId)) as SessionSnapshot | null;
         if (!snapshot) {
           console.log(yellow("session snapshot unavailable"));
@@ -1130,7 +1348,7 @@ async function runInteractiveChat(
         continue;
       }
 
-      if (line === "/plan") {
+      if (commandLine === "/plan") {
         mode = "plan";
         await actor.setSessionConfig(sessionId, settings.model, mode);
         footer.update({ mode });
@@ -1138,7 +1356,7 @@ async function runInteractiveChat(
         continue;
       }
 
-      if (line === "/approve" || line === "/act") {
+      if (commandLine === "/approve" || commandLine === "/act") {
         mode = "act";
         await actor.setSessionConfig(sessionId, settings.model, mode);
         footer.update({ mode });
@@ -1146,7 +1364,7 @@ async function runInteractiveChat(
         continue;
       }
 
-      if (line === "/yes") {
+      if (commandLine === "/yes") {
         mode = "yolo";
         await actor.setSessionConfig(sessionId, settings.model, mode);
         footer.update({ mode });
@@ -1154,7 +1372,7 @@ async function runInteractiveChat(
         continue;
       }
 
-      if (line === "/no") {
+      if (commandLine === "/no") {
         mode = "act";
         await actor.setSessionConfig(sessionId, settings.model, mode);
         footer.update({ mode });
@@ -1162,7 +1380,7 @@ async function runInteractiveChat(
         continue;
       }
 
-      if (line === "/diff") {
+      if (commandLine === "/diff") {
         const unstaged = await runGit(["diff", "--color=always"]);
         if (!unstaged.ok) {
           console.log(errorColor(unstaged.stderr.trim() || "git diff failed"));
@@ -1186,8 +1404,8 @@ async function runInteractiveChat(
         continue;
       }
 
-      if (line.startsWith("/git")) {
-        const rawArgs = line.slice("/git".length).trim();
+      if (commandLine?.startsWith("/git")) {
+        const rawArgs = commandLine.slice("/git".length).trim();
         if (!rawArgs) {
           console.log(yellow("Usage: /git <command>"));
           continue;
@@ -1215,7 +1433,7 @@ async function runInteractiveChat(
         continue;
       }
 
-      if (line === "/commit") {
+      if (commandLine === "/commit") {
         const status = await runGit(["status", "--porcelain"]);
         if (!status.ok) {
           console.log(errorColor(status.stderr.trim() || "Not a git repository."));
@@ -1236,7 +1454,7 @@ async function runInteractiveChat(
           if (!shouldStage) {
             console.log(yellow("Nothing staged. Stage tracked file changes with git add -u?"));
             console.log(dim(status.stdout.trim()));
-            const answer = (await rl.question(cyan("[y/N] "))).trim().toLowerCase();
+            const answer = (await askLine(cyan("[y/N] "))).trim().toLowerCase();
             shouldStage = answer === "y" || answer === "yes";
           }
           if (!shouldStage) {
@@ -1266,7 +1484,7 @@ async function runInteractiveChat(
           console.log(`\n${bold("Proposed commit message:")}\n${proposed}\n`);
           const finalMessage = mode === "yolo"
             ? proposed
-            : await promptForCommitMessageOverride(rl, proposed);
+            : await promptForCommitMessageOverride(askLine, proposed);
           if (!finalMessage) {
             console.log(yellow("Commit aborted."));
             continue;
@@ -1296,10 +1514,10 @@ async function runInteractiveChat(
         continue;
       }
 
-      if (line === "/undo") {
+      if (commandLine === "/undo") {
         let confirmed = mode === "yolo";
         if (!confirmed) {
-          const answer = (await rl.question(cyan("Remove last conversation turn? [y/N] ")))
+          const answer = (await askLine(cyan("Remove last conversation turn? [y/N] ")))
             .trim()
             .toLowerCase();
           confirmed = answer === "y" || answer === "yes";
@@ -1341,7 +1559,7 @@ async function runInteractiveChat(
         continue;
       }
 
-      if (line === "/checkpoint") {
+      if (commandLine === "/checkpoint") {
         const checkpoint = await runGit(["stash", "create", `cli-checkpoint-${sessionId.slice(0, 8)}`]);
         if (!checkpoint.ok) {
           console.log(errorColor(checkpoint.stderr.trim() || "checkpoint failed"));
@@ -1358,14 +1576,14 @@ async function runInteractiveChat(
         continue;
       }
 
-      if (line === "/rollback") {
+      if (commandLine === "/rollback") {
         if (!checkpointRef) {
           console.log(yellow("No checkpoint available."));
           continue;
         }
         let confirmed = mode === "yolo";
         if (!confirmed) {
-          const answer = (await rl.question(cyan("Rollback tracked files to the last checkpoint? [y/N] ")))
+          const answer = (await askLine(cyan("Rollback tracked files to the last checkpoint? [y/N] ")))
             .trim()
             .toLowerCase();
           confirmed = answer === "y" || answer === "yes";
@@ -1395,7 +1613,7 @@ async function runInteractiveChat(
         continue;
       }
 
-      if (line === "/autotest") {
+      if (commandLine === "/autotest") {
         autoTestEnabled = !autoTestEnabled;
         const projectDir = resolveProjectDir(currentProject);
         console.log(`Auto-test: ${autoTestEnabled ? infoColor("ON") : errorColor("OFF")}`);
@@ -1411,7 +1629,7 @@ async function runInteractiveChat(
         continue;
       }
 
-      if (line === "/watch") {
+      if (commandLine === "/watch") {
         watchEnabled = !watchEnabled;
         console.log(`File watcher: ${watchEnabled ? infoColor("ON") : errorColor("OFF")}`);
         if (watchEnabled) {
@@ -1434,7 +1652,7 @@ async function runInteractiveChat(
         continue;
       }
 
-      if (line === "/skills") {
+      if (commandLine === "/skills") {
         const skillFiles = [
           ...listSkillFiles(path.join(homedir(), ".config", "vibe-local", "skills")),
           ...listSkillFiles(path.join(REPO_ROOT, ".vibe-local", "skills")),
@@ -1450,7 +1668,7 @@ async function runInteractiveChat(
         continue;
       }
 
-      if (line === "/init") {
+      if (commandLine === "/init") {
         const claudeMdPath = path.join(REPO_ROOT, "CLAUDE.md");
         if (existsSync(claudeMdPath)) {
           console.log(yellow("CLAUDE.md already exists in this directory."));
@@ -1477,7 +1695,7 @@ async function runInteractiveChat(
       }
 
       try {
-        const runPromise = actor.runAgentTurn(sessionId, line, settings, currentProject);
+        const runPromise = actor.runAgentTurn(sessionId, rawLine, settings, currentProject);
         await watchSessionProgress(actor, sessionId, runPromise, footer);
         const result = (await runPromise) as Record<string, unknown>;
         if (result?.error && typeof result.error === "string") {
@@ -1533,7 +1751,6 @@ async function runInteractiveChat(
   } finally {
     fileWatcher?.stop();
     footer.teardown();
-    rl.close();
   }
 }
 
