@@ -47,6 +47,7 @@ The key shift is conceptual: host persistence remains useful, but it stops being
 ### Workspace layer owns
 
 - bounded file reads and writes
+- bounded workspace shell commands over capability-controlled mounts
 - file metadata and change tracking
 - workspace snapshots
 - future sync policy with AgentFS-backed storage

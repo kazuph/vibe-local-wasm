@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { REPO_ROOT, TOOL_ROOT, VM_REPO_PATH } from "./config.js";
 import { createAgentosClient, waitForManager } from "./client.js";
+import { runWorkspaceShell } from "./tools/workspace-shell.js";
 
 async function getFreePort(preferred: number): Promise<number> {
   const tryPort = (port: number) =>
@@ -87,6 +88,9 @@ async function main() {
       cwd: REPO_ROOT,
       timeoutMs: 15_000,
     })) as { stdout: string };
+    const workspaceShellResult = await runWorkspaceShell({
+      command: "printf 'workspace-shell-ok' > smoke.txt && cat smoke.txt && rm smoke.txt",
+    });
 
     console.log("Smoke test passed.");
     console.log(`- manager endpoint: ${endpoint}`);
@@ -100,6 +104,7 @@ async function main() {
       `- sandbox agents: ${sandboxAgents.agents.map((agent) => agent.id).join(", ")}`,
     );
     console.log(`- runProcess pwd: ${processResult.stdout.trim()}`);
+    console.log(`- workspace shell stdout: ${workspaceShellResult.stdout.trim()}`);
   } catch (error) {
     failure = error;
   } finally {

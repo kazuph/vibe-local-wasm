@@ -8,6 +8,7 @@ import {
   runProjectScript,
 } from "./projects.js";
 import { runGit, searchCode } from "./shared/git-utils.js";
+import { runWorkspaceShell, workspaceShellInputSchema } from "./tools/workspace-shell.js";
 
 export const repoToolkit = toolKit({
   name: "repo",
@@ -74,6 +75,20 @@ export const repoToolkit = toolKit({
         {
           description: "Find where localStorage is used",
           input: { query: "localStorage", maxResults: 20 },
+        },
+      ],
+    }),
+    workspaceShell: hostTool({
+      description:
+        "Run a bounded just-bash shell against /mnt/repo (read-only) and /mnt/workspace (read-write scratch).",
+      inputSchema: workspaceShellInputSchema,
+      async execute(input) {
+        return runWorkspaceShell(input);
+      },
+      examples: [
+        {
+          description: "Inspect package files without leaving the workspace surface",
+          input: { command: "ls /mnt/repo && cat /mnt/repo/package.json | head -20" },
         },
       ],
     }),

@@ -29,6 +29,7 @@ export const WORKSPACE_CAPABILITY_SURFACE = [
   "bounded file read/write/edit",
   "glob and grep under sandbox policy",
   "structured web fetch/search",
+  "bounded workspace shell via just-bash",
   "workspace scratch files",
 ] as const;
 

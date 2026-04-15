@@ -8,6 +8,7 @@
 - `workspaceVm`: `agentOS` 上で Pi と capability-oriented host toolkits を動かす高速な VM
 - `codingSandbox`: `sandbox-agent` を `local` provider 経由で起動する external execution plane
 - repo 全体を `agentOS` に read-only mount し、host 側で project discovery と script 実行を補助
+- `workspaceVm` には `just-bash` ベースの bounded shell capability も載せる
 
 ## 設計原則
 

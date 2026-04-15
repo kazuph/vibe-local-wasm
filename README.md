@@ -15,6 +15,7 @@
   - tool routing
   - capability 判定
   - 可能な範囲の file / web / structured tool execution
+  - bounded workspace shell (`just-bash`)
 - **外部 sandbox 側**
   - Wasm / Workers では扱いづらい処理
   - 任意 Bash / subprocess
@@ -46,6 +47,7 @@ CLI/TUI の体験は本家 vibe-local に準拠します。本家にないコマ
   - agentOS manager
   - actor-local SQLite persistence
   - JS bridge for file / web / task / sub-agent tools
+  - workspaceVm host toolkit に `just-bash` ベースの bounded shell を追加
 
 実装済みの CLI quality gap:
 
