@@ -24,6 +24,10 @@ import {
   toPosixPath,
 } from "./config.js";
 import { discoverProjects } from "./projects.js";
+import {
+  describeExecutionContract,
+  formatSandboxDelegationClasses,
+} from "./shared/execution-contract.js";
 import { gitToolkit, repoToolkit } from "./toolkits.js";
 import { vibeLocalActor } from "./vibe-local-actor.js";
 
@@ -38,6 +42,9 @@ function formatRepoInstructions(): string {
     `Pi global config is mounted at ${VM_PI_AGENT_PATH} and ${VM_PI_AGENT_ROOT_PATH}. It persists on the host at ${piHost}.`,
     "Prefer the host toolkits named repo and git for project discovery, script execution, and repository inspection.",
     "When a project needs a full coding agent such as Codex or Claude Code, hand off to the codingSandbox actor instead of assuming the agent is installed inside agentOS.",
+    "The codingSandbox actor is reserved for explicit delegated execution classes:",
+    formatSandboxDelegationClasses(),
+    "Keep routing, approvals, configuration, and audit in the control plane.",
   ].join("\n");
 }
 
@@ -96,6 +103,9 @@ const workspaceVm = agentOs({
   },
 });
 
+// External execution plane for explicit delegated classes such as Bash,
+// native subprocess work, build/test workflows, full coding-agent handoff,
+// and future MCP server spawn. The control plane decides when to delegate.
 const codingSandbox = sandboxActor({
   provider: local({
     port: SANDBOX_AGENT_PORT,
@@ -129,6 +139,7 @@ export const registry = setup({
   use: {
     workspaceVm,
     codingSandbox,
+    // Trusted control plane: owns session state, routing, approvals, and audit.
     vibeLocal: vibeLocalActor,
   } as any,
 });
@@ -144,6 +155,7 @@ export async function describeRegistry() {
       repo: VM_REPO_PATH,
       workspace: VM_WORKSPACE_PATH,
     },
+    executionContract: describeExecutionContract(),
     projects,
   };
 }

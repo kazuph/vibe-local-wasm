@@ -723,6 +723,8 @@ function buildFunctionSchema(
   };
 }
 
+// These schemas describe the current synchronous bridge surface exposed to
+// vibe-coder.py. See docs/sandbox-contract.md for the execution-layer contract.
 const SUBAGENT_TOOL_SCHEMAS = {
   Read: buildFunctionSchema(
     "Read",
@@ -1378,6 +1380,9 @@ async function initPyodide() {
       try {
         switch (name) {
           case "Bash": {
+            // Compatibility path: restricted Bash still runs through the
+            // synchronous bridge. The architectural contract keeps arbitrary
+            // shell in the explicit delegated execution class.
             const cmd = String(params.command ?? "");
             if (!cmd) return JSON.stringify({ ok: false, error: "No command" });
             const timeoutMs = Number(params.timeout ?? 120_000);

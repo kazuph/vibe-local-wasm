@@ -53,7 +53,7 @@
 | `SubAgent` / `ParallelAgents` | JS-side mini loop / worker coordination | good fit for control plane orchestration |
 | `Bash` | restricted execution path | keep as explicit escape hatch, not default architecture |
 | `NotebookEdit` / `Task*` / `AskUserQuestion` | JS bridge in control plane | keep in-core |
-| file watcher / auto-test | not finished | likely hybrid: detection/control in control plane, heavy execution in sandbox |
+| file watcher / auto-test | implemented with control-plane ownership | keep policy / audit in control plane, delegate heavy execution only when necessary |
 | MCP | not finished | likely sandbox execution with control-plane ownership |
 
 ## 5. Design rules for future work

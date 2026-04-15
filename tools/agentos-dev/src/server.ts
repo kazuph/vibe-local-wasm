@@ -12,6 +12,9 @@ async function main() {
   console.log(`Sandbox Agent provider port: ${SANDBOX_AGENT_PORT}`);
   console.log(`Repo mount: ${summary.mounts.repo} -> ${summary.repoRoot}`);
   console.log(`Writable workspace mount: ${summary.mounts.workspace}`);
+  console.log(
+    `Sandbox delegation classes: ${summary.executionContract.sandbox.delegatedOperationClasses.map((entry) => entry.id).join(", ")}`,
+  );
   console.log(`Discovered projects: ${summary.projects.length}`);
 
   for (const project of summary.projects) {

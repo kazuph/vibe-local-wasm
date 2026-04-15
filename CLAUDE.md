@@ -199,7 +199,8 @@ CLI → vibeLocal actor → Pyodide runtime → agentOS Manager surfaces
 - **Wasm-first control plane**: policy / audit / orchestration は agentOS + Pyodide 側に置き、非WASM処理だけを external sandbox に委譲する。
 - **AgentFS is a mirror/audit layer**: 現状は host filesystem が source of truth だが、長期的には capability-mediated workspace を厚くしていく。
 - **Execution modes**: Plan / Act（本家準拠）。YOLO は本家の `--yes` フラグに相当。
-- **本家で実装済みだがこちらで未実装**: file watcher, auto-test loop, MCP連携, `/undo`
+- **Sandbox contract**: explicit delegated execution classes are documented in `docs/sandbox-contract.md`
+- **Current roadmap focus**: sandbox contract, virtual workspace evolution, MCP layering
 
 ## Technology Stack
 
