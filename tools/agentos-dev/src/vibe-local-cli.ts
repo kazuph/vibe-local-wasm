@@ -849,6 +849,22 @@ function consumeEscapeSequence(value: string) {
   return 1;
 }
 
+function parseCsiuKey(value: string) {
+  const match = value.match(/^\x1b\[(\d+)(?:;(\d+))?u/);
+  if (!match) {
+    return null;
+  }
+  const codepoint = Number.parseInt(match[1] ?? "", 10);
+  const modifierValue = Number.parseInt(match[2] ?? "1", 10);
+  const modifierMask = Math.max(0, modifierValue - 1);
+  return {
+    codepoint,
+    ctrl: (modifierMask & 4) !== 0,
+    length: match[0].length,
+    shift: (modifierMask & 1) !== 0,
+  };
+}
+
 function renderChatDraft(prompt: string, draft: string, previousLineCount: number) {
   const continuationPrompt = gray("| ");
   const lines = draft.split("\n");
@@ -954,6 +970,28 @@ async function readChatDraft(prompt: string, fallbackAskLine: AskLine): Promise<
           if (shiftEnter) {
             pending = pending.slice(shiftEnter.length);
             appendText("\n");
+            continue;
+          }
+
+          const csiuKey = parseCsiuKey(pending);
+          if (csiuKey) {
+            pending = pending.slice(csiuKey.length);
+            if (csiuKey.codepoint === 13) {
+              if (csiuKey.shift) {
+                appendText("\n");
+                continue;
+              }
+              finish(draft);
+              return;
+            }
+            if (csiuKey.codepoint === 99 && csiuKey.ctrl) {
+              finish(null);
+              return;
+            }
+            if (csiuKey.codepoint === 100 && csiuKey.ctrl && draft.length === 0) {
+              finish(null);
+              return;
+            }
             continue;
           }
 
