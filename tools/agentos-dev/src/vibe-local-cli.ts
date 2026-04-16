@@ -866,10 +866,10 @@ function parseCsiuKey(value: string) {
 }
 
 function renderChatDraft(prompt: string, draft: string, previousLineCount: number) {
-  const continuationPrompt = gray("| ");
   const lines = draft.split("\n");
   const renderedLines = lines.length === 0 ? [""] : lines;
   const totalRows = Math.max(previousLineCount, renderedLines.length);
+  const blankLinePrompt = prompt.replace(/ \x1b\[0m$/, "\x1b[0m");
   let frame = "\r";
 
   if (previousLineCount > 1) {
@@ -886,8 +886,8 @@ function renderChatDraft(prompt: string, draft: string, previousLineCount: numbe
   }
   frame += "\r";
   for (let index = 0; index < renderedLines.length; index += 1) {
-    const prefix = index === 0 ? prompt : continuationPrompt;
-    frame += `${CSI}2K${prefix}${renderedLines[index]}`;
+    const promptForLine = renderedLines[index] === "" ? blankLinePrompt : prompt;
+    frame += `${CSI}2K${promptForLine}${renderedLines[index]}`;
     if (index < renderedLines.length - 1) {
       frame += `${CSI}1B\r`;
     }
