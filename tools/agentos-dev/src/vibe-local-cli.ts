@@ -829,11 +829,74 @@ function consumeEscapeSequence(value: string) {
   return 1;
 }
 
-function renderChatDraft(prompt: string, draft: string, previousLineCount: number) {
+function codePoints(value: string) {
+  return Array.from(value);
+}
+
+function stripAnsi(value: string) {
+  return value.replace(/\x1b\[[0-9;?]*[@-~]/g, "");
+}
+
+function insertAtCursor(value: string, cursorIndex: number, text: string) {
+  const chars = codePoints(value);
+  const insertChars = codePoints(text);
+  chars.splice(cursorIndex, 0, ...insertChars);
+  return {
+    cursorIndex: cursorIndex + insertChars.length,
+    value: chars.join(""),
+  };
+}
+
+function removeBeforeCursor(value: string, cursorIndex: number) {
+  if (cursorIndex <= 0) {
+    return { cursorIndex, value };
+  }
+  const chars = codePoints(value);
+  chars.splice(cursorIndex - 1, 1);
+  return {
+    cursorIndex: cursorIndex - 1,
+    value: chars.join(""),
+  };
+}
+
+function getCursorLineCol(value: string, cursorIndex: number) {
+  const chars = codePoints(value);
+  let line = 0;
+  let col = 0;
+  for (let index = 0; index < Math.min(cursorIndex, chars.length); index += 1) {
+    if (chars[index] === "\n") {
+      line += 1;
+      col = 0;
+    } else {
+      col += 1;
+    }
+  }
+  return { col, line };
+}
+
+function cursorIndexFromLineCol(value: string, targetLine: number, targetCol: number) {
+  const lines = value.split("\n").map((line) => codePoints(line));
+  const lineIndex = Math.max(0, Math.min(targetLine, lines.length - 1));
+  const colIndex = Math.max(0, Math.min(targetCol, lines[lineIndex]?.length ?? 0));
+  let cursorIndex = 0;
+  for (let index = 0; index < lineIndex; index += 1) {
+    cursorIndex += (lines[index]?.length ?? 0) + 1;
+  }
+  return cursorIndex + colIndex;
+}
+
+function moveCursorVertical(value: string, cursorIndex: number, delta: -1 | 1) {
+  const { col, line } = getCursorLineCol(value, cursorIndex);
+  return cursorIndexFromLineCol(value, line + delta, col);
+}
+
+function renderChatDraft(prompt: string, draft: string, cursorIndex: number, previousLineCount: number) {
   const lines = draft.split("\n");
   const renderedLines = lines.length === 0 ? [""] : lines;
   const totalRows = Math.max(previousLineCount, renderedLines.length);
   const blankLinePrompt = prompt.replace(/ \x1b\[0m$/, "\x1b[0m");
+  const promptWidth = stripAnsi(blankLinePrompt).length;
+  const { col: cursorCol, line: cursorLine } = getCursorLineCol(draft, cursorIndex);
   let frame = "\r";
 
   if (previousLineCount > 1) {
@@ -856,14 +919,13 @@ function renderChatDraft(prompt: string, draft: string, previousLineCount: numbe
       frame += `${CSI}1B\r`;
     }
   }
+  if (renderedLines.length - 1 > cursorLine) {
+    frame += `${CSI}${renderedLines.length - 1 - cursorLine}A`;
+  }
+  frame += "\r";
+  frame += `${CSI}${promptWidth + cursorCol}C`;
   output.write(frame);
   return renderedLines.length;
-}
-
-function removeLastCharacter(value: string) {
-  const chars = Array.from(value);
-  chars.pop();
-  return chars.join("");
 }
 
 async function readChatDraft(prompt: string, fallbackAskLine: AskLine): Promise<string | null> {
@@ -873,6 +935,7 @@ async function readChatDraft(prompt: string, fallbackAskLine: AskLine): Promise<
 
   return await new Promise<string | null>((resolve, reject) => {
     let draft = "";
+    let cursorIndex = 0;
     let renderedLineCount = 1;
     let pending = "";
     let pasteMode = false;
@@ -906,8 +969,10 @@ async function readChatDraft(prompt: string, fallbackAskLine: AskLine): Promise<
       if (!text) {
         return;
       }
-      draft += text;
-      renderedLineCount = renderChatDraft(prompt, draft, renderedLineCount);
+      const next = insertAtCursor(draft, cursorIndex, text);
+      draft = next.value;
+      cursorIndex = next.cursorIndex;
+      renderedLineCount = renderChatDraft(prompt, draft, cursorIndex, renderedLineCount);
     };
 
     const onData = (chunk: Buffer) => {
@@ -962,8 +1027,34 @@ async function readChatDraft(prompt: string, fallbackAskLine: AskLine): Promise<
           }
           if (pending[0] === "\u007f" || pending[0] === "\b") {
             pending = pending.slice(1);
-            draft = removeLastCharacter(draft);
-            renderedLineCount = renderChatDraft(prompt, draft, renderedLineCount);
+            const next = removeBeforeCursor(draft, cursorIndex);
+            draft = next.value;
+            cursorIndex = next.cursorIndex;
+            renderedLineCount = renderChatDraft(prompt, draft, cursorIndex, renderedLineCount);
+            continue;
+          }
+          if (pending.startsWith("\x1b[D")) {
+            pending = pending.slice(3);
+            cursorIndex = Math.max(0, cursorIndex - 1);
+            renderedLineCount = renderChatDraft(prompt, draft, cursorIndex, renderedLineCount);
+            continue;
+          }
+          if (pending.startsWith("\x1b[C")) {
+            pending = pending.slice(3);
+            cursorIndex = Math.min(codePoints(draft).length, cursorIndex + 1);
+            renderedLineCount = renderChatDraft(prompt, draft, cursorIndex, renderedLineCount);
+            continue;
+          }
+          if (pending.startsWith("\x1b[A")) {
+            pending = pending.slice(3);
+            cursorIndex = moveCursorVertical(draft, cursorIndex, -1);
+            renderedLineCount = renderChatDraft(prompt, draft, cursorIndex, renderedLineCount);
+            continue;
+          }
+          if (pending.startsWith("\x1b[B")) {
+            pending = pending.slice(3);
+            cursorIndex = moveCursorVertical(draft, cursorIndex, 1);
+            renderedLineCount = renderChatDraft(prompt, draft, cursorIndex, renderedLineCount);
             continue;
           }
           if (pending[0] === "\x1b") {
@@ -986,7 +1077,7 @@ async function readChatDraft(prompt: string, fallbackAskLine: AskLine): Promise<
     try {
       input.setRawMode(true);
       output.write(BRACKETED_PASTE_ENABLE);
-      renderedLineCount = renderChatDraft(prompt, draft, renderedLineCount);
+      renderedLineCount = renderChatDraft(prompt, draft, cursorIndex, renderedLineCount);
       input.on("data", onData);
     } catch (error) {
       fail(error);
