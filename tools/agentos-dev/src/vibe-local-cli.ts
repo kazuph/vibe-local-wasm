@@ -869,24 +869,29 @@ function renderChatDraft(prompt: string, draft: string, previousLineCount: numbe
   const continuationPrompt = gray("| ");
   const lines = draft.split("\n");
   const renderedLines = lines.length === 0 ? [""] : lines;
+  const totalRows = Math.max(previousLineCount, renderedLines.length);
   let frame = "\r";
 
   if (previousLineCount > 1) {
     frame += `${CSI}${previousLineCount - 1}A`;
   }
-  for (let index = 0; index < previousLineCount; index += 1) {
+  for (let index = 0; index < totalRows; index += 1) {
     frame += `${CSI}2K`;
-    if (index < previousLineCount - 1) {
-      frame += `${CSI}1B`;
+    if (index < totalRows - 1) {
+      frame += `${CSI}1B\r`;
     }
   }
-  if (previousLineCount > 1) {
-    frame += `${CSI}${previousLineCount - 1}A`;
+  if (totalRows > 1) {
+    frame += `${CSI}${totalRows - 1}A`;
   }
   frame += "\r";
-  frame += renderedLines
-    .map((line, index) => `${index === 0 ? prompt : continuationPrompt}${line}`)
-    .join("\n");
+  for (let index = 0; index < renderedLines.length; index += 1) {
+    const prefix = index === 0 ? prompt : continuationPrompt;
+    frame += `${CSI}2K${prefix}${renderedLines[index]}`;
+    if (index < renderedLines.length - 1) {
+      frame += `${CSI}1B\r`;
+    }
+  }
   output.write(frame);
   return renderedLines.length;
 }
